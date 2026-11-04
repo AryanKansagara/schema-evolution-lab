@@ -2,7 +2,7 @@
 
 A Schema Registry compatibility checker for a subject's whole version history. Avro, JSON Schema and Protobuf.
 
-**Live:** LIVE_URL
+**Live:** https://schema-evolution-lab.vercel.app
 
 ## The pain
 
