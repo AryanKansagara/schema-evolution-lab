@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type KeyboardEvent } from 'react'
 import { Footer, Header } from './App.tsx'
-import { analyze, applyFix, detectFormat, type Subject, type Version } from './engine/compat.ts'
+import { analyze, applyFix, importFile, type Subject, type Version } from './engine/compat.ts'
 import { SAMPLES, STARTERS } from './engine/samples.ts'
 import { decodeSubject, encodeSubject } from './engine/share.ts'
 import { MODES, type Fix, type Format, type Mode } from './engine/types.ts'
@@ -123,7 +123,13 @@ export default function Lab() {
 
   const patch = (p: Partial<Subject>) => setSubject((s) => ({ ...s, ...p }))
   const setVersions = (versions: Version[]) => patch({ versions })
-  const editText = (text: string) => setVersions(subject.versions.map((v, i) => (i === sel ? { ...v, text } : v)))
+  const editText = (raw: string) => {
+    // A pasted registry API response is unwrapped to the schema inside it.
+    const [one, ...more] = raw.trimStart().startsWith('{') && raw.includes('"schema"') ? importFile('pasted', raw) : []
+    const text = one && !more.length && one.version !== undefined && one.format === subject.format ? one.text : raw
+    if (text !== raw) setToast({ msg: `Unwrapped the schema from the registry response (${one.name})` })
+    setVersions(subject.versions.map((v, i) => (i === sel ? { ...v, text } : v)))
+  }
 
   const addVersion = () => {
     setVersions([...subject.versions, { id: newId(), text: subject.versions[n - 1].text }])
@@ -168,12 +174,15 @@ export default function Lab() {
 
   const addFiles = async (files: File[]) => {
     const sorted = files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
-    const read = await Promise.all(sorted.map(async (file) => ({ name: file.name, text: await file.text() })))
+    const read = (await Promise.all(sorted.map(async (file) => importFile(file.name, await file.text())))).flat()
     if (!read.length) return
-    const format = detectFormat(read[0].name, read[0].text)
+    const format = read[0].format
     const added = read.map((r) => ({ id: newId(), text: r.text }))
-    if (format !== subject.format) {
-      load({ ...subject, format, versions: added }, `${read[0].name} is ${format}, so this is now a new ${format} subject`, subject)
+    // A registry export carries its own subject name and version order, so it replaces the timeline.
+    const exported = read[0].subject !== undefined && read.length > 1
+    if (format !== subject.format || exported) {
+      const name = read[0].subject ?? subject.name
+      load({ ...subject, name, format, versions: added }, exported ? `Loaded ${added.length} versions of ${name} from the registry export` : `${read[0].name} is ${format}, so this is now a new ${format} subject`, subject)
       return
     }
     setVersions([...subject.versions, ...added])

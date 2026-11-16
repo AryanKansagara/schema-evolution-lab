@@ -1,6 +1,7 @@
 import { useEffect, useState, type MouseEvent, type ReactNode } from 'react'
 import Landing from './Landing.tsx'
 import Lab from './Lab.tsx'
+import Docs from './Docs.tsx'
 
 export function go(href: string) {
   history.pushState({}, '', href)
@@ -61,6 +62,9 @@ export function Header({ onDark }: { onDark?: boolean }) {
         <Link href="/#samples" className="nav-link hide-sm">
           Samples
         </Link>
+        <Link href="/docs" className="nav-link hide-sm">
+          How it works
+        </Link>
         <Link href="/app" className="btn btn-primary btn-sm">
           Open the lab
         </Link>
@@ -73,7 +77,10 @@ export function Header({ onDark }: { onDark?: boolean }) {
 export function Footer({ wide }: { wide?: boolean }) {
   return (
     <footer className={'footer' + (wide ? ' lab-foot' : '')}>
-      <div className="wrap">Built by Aryan Kansagara. Independent project, not affiliated with Confluent.</div>
+      <div className="wrap">
+        <Link href="/docs">How it works</Link> · <a href="https://github.com/AryanKansagara/schema-evolution-lab">Source</a> · Built by Aryan Kansagara. Independent project, not
+        affiliated with Confluent.
+      </div>
     </footer>
   )
 }
@@ -85,5 +92,5 @@ export default function App() {
     addEventListener('popstate', onPop)
     return () => removeEventListener('popstate', onPop)
   }, [])
-  return path.startsWith('/app') ? <Lab /> : <Landing />
+  return path.startsWith('/app') ? <Lab /> : path.startsWith('/docs') ? <Docs /> : <Landing />
 }

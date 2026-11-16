@@ -262,9 +262,46 @@ export function canonicalText(format: Format, text: string): string {
   }
 }
 
+export interface Imported {
+  name: string
+  text: string
+  format: Format
+  /** Present when the file was a Schema Registry API response. */
+  subject?: string
+  version?: number
+}
+
+const FORMATS: Format[] = ['AVRO', 'JSON', 'PROTOBUF']
+
+/**
+ * Turns an uploaded file into schema versions. Besides plain .avsc / .json / .proto files this accepts what the
+ * Schema Registry REST API returns for GET /subjects/{subject}/versions/{version}:
+ *   {"subject":"orders-value","version":3,"id":100042,"schemaType":"JSON","schema":"{\"type\":...}"}
+ * (schemaType is left out for Avro), or an array of those, e.g. collected with `jq -s`.
+ */
+export function importFile(name: string, text: string): Imported[] {
+  let doc: unknown
+  try {
+    doc = JSON.parse(text)
+  } catch {
+    return [{ name, text, format: detectFormat(name, text) }]
+  }
+  const isEnvelope = (d: any) => d && typeof d === 'object' && !Array.isArray(d) && typeof d.schema === 'string' && d.type === undefined
+  const list = Array.isArray(doc) && doc.length && doc.every(isEnvelope) ? (doc as any[]) : isEnvelope(doc) ? [doc as any] : null
+  if (!list) return [{ name, text, format: detectFormat(name, text) }]
+  return list
+    .map((d) => {
+      const format: Format = FORMATS.includes(d.schemaType) ? d.schemaType : 'AVRO'
+      const version = Number.isInteger(d.version) ? (d.version as number) : undefined
+      return { name: version === undefined ? name : `${d.subject ?? name} v${version}`, text: canonicalText(format, d.schema), format, subject: typeof d.subject === 'string' ? d.subject : undefined, version }
+    })
+    .sort((a, b) => (a.version ?? 0) - (b.version ?? 0))
+}
+
 export function detectFormat(filename: string, text: string): Format {
-  if (/\.proto$/i.test(filename) || /^\s*(syntax\s*=|message\s+\w+|package\s+[\w.]+\s*;)/m.test(text)) return 'PROTOBUF'
+  if (/\.proto$/i.test(filename)) return 'PROTOBUF'
   if (/\.avsc$/i.test(filename)) return 'AVRO'
+  if (/^\s*(syntax\s*=|message\s+\w+|package\s+[\w.]+\s*;)/m.test(text) && !/^\s*[{["]/.test(text)) return 'PROTOBUF'
   try {
     const doc = JSON.parse(text)
     if (Array.isArray(doc) || typeof doc === 'string') return 'AVRO'

@@ -1,0 +1,23 @@
+[
+  {
+    "subject": "shipments-value",
+    "version": 2,
+    "id": 100061,
+    "schemaType": "JSON",
+    "schema": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Shipment\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"shipment_id\":{\"type\":\"string\"},\"carrier\":{\"type\":\"string\",\"enum\":[\"DHL\",\"UPS\",\"FEDEX\"]},\"weight_kg\":{\"type\":\"number\",\"minimum\":0}},\"required\":[\"shipment_id\",\"carrier\"]}"
+  },
+  {
+    "subject": "shipments-value",
+    "version": 1,
+    "id": 100017,
+    "schemaType": "JSON",
+    "schema": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Shipment\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"shipment_id\":{\"type\":\"string\"},\"carrier\":{\"type\":\"string\",\"enum\":[\"DHL\",\"UPS\"]}},\"required\":[\"shipment_id\",\"carrier\"]}"
+  },
+  {
+    "subject": "shipments-value",
+    "version": 3,
+    "id": 100140,
+    "schemaType": "JSON",
+    "schema": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Shipment\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"shipment_id\":{\"type\":\"string\"},\"carrier\":{\"type\":\"string\"},\"weight_kg\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"shipment_id\",\"carrier\",\"weight_kg\"]}"
+  }
+]

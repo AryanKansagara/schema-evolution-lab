@@ -19,6 +19,8 @@ Schema Registry answers a bad registration with a 409 and an error type. It chec
 - **Upgrade order** per mode, and per transition based on what it actually allows
 - **Avro simulation**: generate or edit a record, then watch the reader fill defaults, drop fields and promote types
 - **Shareable URLs**: the subject is compressed into the hash, so nothing leaves the browser
+- **Registry exports**: load what `GET /subjects/{subject}/versions/{version}` returns, one response or an array of them, as an ordered subject
+- **How it works** at `/docs`: the rules per format, the limits, and the sources
 
 ## Run locally
 
@@ -29,8 +31,29 @@ npm test
 npm run build
 ```
 
+## Checked against the registry
+
+The Schema Registry repository ships data files of schema pairs with the differences its diff code must report
+(`diff-schema-examples.json` and `diff-combined-schema-examples.json` under each provider's test resources). On
+2026-11-16 the engine was run against all of them:
+
+| Suite | Examples | Same verdict | Same difference list and paths |
+| --- | --- | --- | --- |
+| JSON Schema | 139 | 139 | 139 |
+| Protobuf | 54 | 50 | 47 |
+
+The seven Protobuf examples that differ all depend on the contents of an imported file registered under another
+subject. Those data files are under the Confluent Community License and are not copied into this repository; the tests
+in `src/engine/conformance.test.ts` were written for this project and cover the same rules. Avro rules were re-read
+against Apache Avro's `SchemaCompatibility.java`.
+
+Real files used by the tests are listed with their sources and licences in `src/engine/fixtures/SOURCES.md`.
+
 ## Known limits
 
-- JSON Schema: `dependencies` keywords and external `$ref`s aren't compared.
-- Protobuf: imported types are compared by name only. Schema references between subjects aren't resolved.
+- Schema references between subjects aren't resolved. An external JSON Schema `$ref` is a parse error, and an imported Protobuf type is compared by name only.
+- The registry's normalization, rule sets, metadata and `confluent:reserved` fields aren't modeled.
+- Where matching `oneOf`/`anyOf`/`allOf` branches has more than one valid answer, the compatible differences listed can differ from the registry's. The verdict is the same.
+- Avro logical types aren't compared (as in Avro itself), so a changed decimal scale passes.
 - Each matrix row assumes every earlier version is registered. A real registry would refuse a rejected version, so later non-transitive checks there would run against the last accepted one.
+- There is no direct connection to a registry: browsers can't call one without CORS and credentials, so subjects come in as files or pasted text.
