@@ -14,19 +14,22 @@ const STRICT = [
   'EXCLUSIVE_MAXIMUM_INCREASED', 'EXCLUSIVE_MAXIMUM_REMOVED', 'EXCLUSIVE_MINIMUM_DECREASED', 'EXCLUSIVE_MINIMUM_REMOVED',
   'MULTIPLE_OF_REDUCED', 'MULTIPLE_OF_REMOVED',
   'REQUIRED_ATTRIBUTE_WITH_DEFAULT_ADDED', 'REQUIRED_ATTRIBUTE_REMOVED',
+  'DEPENDENCY_ARRAY_NARROWED', 'DEPENDENCY_ARRAY_REMOVED', 'DEPENDENCY_SCHEMA_REMOVED',
   'MAX_PROPERTIES_INCREASED', 'MAX_PROPERTIES_REMOVED', 'MIN_PROPERTIES_DECREASED', 'MIN_PROPERTIES_REMOVED',
-  'ADDITIONAL_PROPERTIES_ADDED', 'ADDITIONAL_PROPERTIES_EXTENDED',
+  'ADDITIONAL_PROPERTIES_ADDED', 'ADDITIONAL_PROPERTIES_EXTENDED', 'UNEVALUATED_PROPERTIES_ADDED', 'UNEVALUATED_PROPERTIES_EXTENDED',
   'PROPERTY_WITH_EMPTY_SCHEMA_ADDED_TO_OPEN_CONTENT_MODEL', 'REQUIRED_PROPERTY_WITH_DEFAULT_ADDED_TO_UNOPEN_CONTENT_MODEL',
   'OPTIONAL_PROPERTY_ADDED_TO_UNOPEN_CONTENT_MODEL', 'PROPERTY_WITH_FALSE_REMOVED_FROM_CLOSED_CONTENT_MODEL',
   'PROPERTY_REMOVED_FROM_OPEN_CONTENT_MODEL', 'PROPERTY_ADDED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL',
   'PROPERTY_REMOVED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL',
   'MAX_ITEMS_INCREASED', 'MAX_ITEMS_REMOVED', 'MIN_ITEMS_DECREASED', 'MIN_ITEMS_REMOVED', 'UNIQUE_ITEMS_REMOVED',
-  'ADDITIONAL_ITEMS_ADDED', 'ADDITIONAL_ITEMS_EXTENDED', 'ITEM_WITH_EMPTY_SCHEMA_ADDED_TO_OPEN_CONTENT_MODEL',
-  'ITEM_ADDED_TO_CLOSED_CONTENT_MODEL', 'ITEM_REMOVED_FROM_OPEN_CONTENT_MODEL',
+  'MAX_CONTAINS_INCREASED', 'MAX_CONTAINS_REMOVED', 'MIN_CONTAINS_DECREASED', 'MIN_CONTAINS_REMOVED',
+  'ADDITIONAL_ITEMS_ADDED', 'ADDITIONAL_ITEMS_EXTENDED', 'UNEVALUATED_ITEMS_ADDED', 'UNEVALUATED_ITEMS_EXTENDED',
+  'ITEM_WITH_EMPTY_SCHEMA_ADDED_TO_OPEN_CONTENT_MODEL', 'ITEM_ADDED_TO_CLOSED_CONTENT_MODEL', 'ITEM_WITH_FALSE_REMOVED_FROM_CLOSED_CONTENT_MODEL',
+  'ITEM_REMOVED_FROM_OPEN_CONTENT_MODEL', 'ITEM_ADDED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', 'ITEM_REMOVED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL',
   'ENUM_ARRAY_EXTENDED', 'COMBINED_TYPE_EXTENDED', 'PRODUCT_TYPE_NARROWED', 'SUM_TYPE_EXTENDED', 'NOT_TYPE_NARROWED',
 ]
 const LENIENT_EXTRA = [
-  'ADDITIONAL_PROPERTIES_NARROWED', 'ADDITIONAL_PROPERTIES_REMOVED',
+  'ADDITIONAL_PROPERTIES_NARROWED', 'ADDITIONAL_PROPERTIES_REMOVED', 'UNEVALUATED_PROPERTIES_NARROWED', 'UNEVALUATED_PROPERTIES_REMOVED',
   'REQUIRED_PROPERTY_WITH_DEFAULT_ADDED_TO_OPEN_CONTENT_MODEL', 'OPTIONAL_PROPERTY_ADDED_TO_OPEN_CONTENT_MODEL',
   'PROPERTY_REMOVED_FROM_CLOSED_CONTENT_MODEL', 'PROPERTY_ADDED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL',
   'PROPERTY_REMOVED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL',
@@ -57,7 +60,12 @@ function checkRefs(root: unknown, node: any, at: string) {
 
 interface Node {
   s: any
+  /** JSON pointer of this schema inside its own document (where fixes are applied). */
   ptr: string
+  /** Location as the registry reports it: shared by both sides and not rewritten by $ref. */
+  path: string
+  /** Set on a synthetic part of a schema (see combo): the schema it was split from. */
+  whole?: Node
 }
 
 interface Ctx {
@@ -70,6 +78,13 @@ interface Ctx {
 }
 
 const COMBOS = ['oneOf', 'anyOf', 'allOf'] as const
+const KINDS = ['enum', 'const', 'not', ...COMBOS] as const
+const ANNOTATIONS = ['$id', 'title', 'description', 'default']
+
+const join = (path: string, seg: string) => (path ? `${path}/${seg}` : seg)
+/** A child schema: `seg` extends the reported path, `pseg` (escaped) the JSON pointer. */
+const kid = (n: Node, s: any, seg: string, pseg = seg): Node => ({ s, ptr: `${n.ptr}/${pseg}`, path: join(n.path, seg) })
+const at = (n: Node, path: string): Node => ({ ...n, path })
 
 function deref(doc: unknown, n: Node): Node {
   let { s, ptr } = n
@@ -77,7 +92,7 @@ function deref(doc: unknown, n: Node): Node {
     ptr = s.$ref.slice(1)
     s = getAt(doc, ptr)
   }
-  return { s, ptr }
+  return { ...n, s, ptr }
 }
 
 /** A schema's everit-style class: same class or the comparison stops at TYPE_CHANGED. */
@@ -91,21 +106,33 @@ function classOf(s: any): string {
   const t = s.type
   if (t === 'integer' || t === 'number') return 'number'
   if (typeof t === 'string') return t
-  if (s.properties || s.additionalProperties !== undefined || s.required || s.patternProperties || s.minProperties !== undefined || s.maxProperties !== undefined) return 'object'
-  if (s.items !== undefined || s.prefixItems || s.maxItems !== undefined || s.minItems !== undefined || s.uniqueItems !== undefined) return 'array'
+  if (s.properties || s.additionalProperties !== undefined || s.required || s.patternProperties || s.minProperties !== undefined || s.maxProperties !== undefined || s.dependencies || s.dependentRequired || s.dependentSchemas || s.unevaluatedProperties !== undefined) return 'object'
+  if (s.items !== undefined || s.prefixItems || s.additionalItems !== undefined || s.maxItems !== undefined || s.minItems !== undefined || s.uniqueItems !== undefined || s.unevaluatedItems !== undefined) return 'array'
   if (s.maxLength !== undefined || s.minLength !== undefined || s.pattern !== undefined) return 'string'
   if (s.maximum !== undefined || s.minimum !== undefined || s.multipleOf !== undefined || s.exclusiveMaximum !== undefined || s.exclusiveMinimum !== undefined) return 'number'
   return 'empty'
 }
 
-/** A type array is a sum type: {"type":["string","null"]} behaves as anyOf of each type. */
-function combo(s: any): { crit: string; subs: (ptr: string) => Node[] } | undefined {
+type Combo = { crit: string; subs: (n: Node) => Node[] }
+
+/**
+ * How the registry's schema loader sees a schema that is more than one thing at once:
+ *  - a type array is a sum type: {"type":["string","null"]} is anyOf of each type;
+ *  - a type next to enum / const / not / oneOf / anyOf / allOf is a product type: allOf of each part.
+ *    So {"type":"string","enum":[...]} is allOf[string, enum], and dropping the enum narrows the product.
+ */
+function combo(s: any): Combo | undefined {
   if (!s || typeof s !== 'object') return undefined
   if (Array.isArray(s.type) && s.type.length > 1)
-    return { crit: 'anyOf', subs: (ptr) => s.type.map((t: string) => ({ s: { ...s, type: t }, ptr })) }
+    return { crit: 'anyOf', subs: (n) => s.type.map((t: string) => ({ s: { ...s, type: t }, ptr: n.ptr, path: n.path, whole: n })) }
   if (Array.isArray(s.type) && s.type.length === 1) return combo({ ...s, type: s.type[0] })
-  for (const k of COMBOS)
-    if (Array.isArray(s[k])) return { crit: k, subs: (ptr) => s[k].map((b: unknown, i: number) => ({ s: b, ptr: `${ptr}/${k}/${i}` })) }
+  const present = KINDS.filter((k) => (k === 'enum' ? Array.isArray(s.enum) : (COMBOS as readonly string[]).includes(k) ? Array.isArray(s[k]) : s[k] !== undefined))
+  if (!present.length) return undefined
+  const base = Object.fromEntries(Object.entries(s).filter(([k]) => !(KINDS as readonly string[]).includes(k) && !ANNOTATIONS.includes(k)))
+  const parts: any[] = [...(classOf(base) === 'empty' ? [] : [base]), ...present.map((k) => ({ [k]: s[k] }))]
+  if (parts.length > 1) return { crit: 'allOf', subs: (n) => parts.map((p) => ({ s: p, ptr: n.ptr, path: n.path, whole: n })) }
+  const k = present[0]
+  if ((COMBOS as readonly string[]).includes(k)) return { crit: k, subs: (n) => s[k].map((b: unknown, i: number) => ({ s: b, ptr: `${n.ptr}/${k}/${i}`, path: n.path })) }
   return undefined
 }
 
@@ -126,7 +153,10 @@ function description(type: string, path: string, a: string, b: string): string {
     return `An array or combined type at path '${path}' has fewer elements in the ${a} schema than the ${b} schema`
   if (has('PRODUCT_TYPE_EXTENDED', 'SUM_TYPE_EXTENDED', 'NOT_TYPE_EXTENDED'))
     return `An array or combined type at path '${path}' has more elements in the ${a} schema than the ${b} schema`
-  if (has('TYPE_CHANGED', 'TYPE_NARROWED', 'COMBINED_TYPE_CHANGED', 'COMBINED_TYPE_SUBSCHEMAS_CHANGED', 'ENUM_ARRAY_CHANGED'))
+  if (has('DEPENDENCY_ARRAY_ADDED', 'DEPENDENCY_SCHEMA_ADDED', 'SCHEMA_ADDED', 'MAX_CONTAINS_ADDED', 'MIN_CONTAINS_ADDED'))
+    return `The keyword at path '${path}' in the ${a} schema is not present in the ${b} schema`
+  if (has('DEPENDENCY_ARRAY_EXTENDED')) return `An array or combined type at path '${path}' has more elements in the ${a} schema than the ${b} schema`
+  if (has('TYPE_CHANGED', 'TYPE_NARROWED', 'COMBINED_TYPE_CHANGED', 'COMBINED_TYPE_SUBSCHEMAS_CHANGED', 'ENUM_ARRAY_CHANGED', 'DEPENDENCY_ARRAY_CHANGED'))
     return `A type at path '${path}' is different between the ${a} schema and the ${b} schema`
   if (has('REQUIRED_PROPERTY_ADDED_TO_OPEN_CONTENT_MODEL', 'REQUIRED_PROPERTY_WITH_DEFAULT_ADDED_TO_OPEN_CONTENT_MODEL', 'OPTIONAL_PROPERTY_ADDED_TO_OPEN_CONTENT_MODEL', 'ITEM_ADDED_TO_OPEN_CONTENT_MODEL'))
     return `The ${a} schema has an open content model and has a property or item at path '${path}' which is missing in the ${b} schema`
@@ -134,9 +164,9 @@ function description(type: string, path: string, a: string, b: string): string {
     return `The ${a} schema has an unopen content model and has a required property at path '${path}' which is missing in the ${b} schema`
   if (has('PROPERTY_REMOVED_FROM_CLOSED_CONTENT_MODEL', 'ITEM_REMOVED_FROM_CLOSED_CONTENT_MODEL'))
     return `The ${a} schema has a closed content model and is missing a property or item present at path '${path}' in the ${b} schema`
-  if (type === 'PROPERTY_REMOVED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL')
+  if (has('PROPERTY_REMOVED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', 'ITEM_REMOVED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL'))
     return `A property or item is missing in the ${a} schema but present at path '${path}' in the ${b} schema and is not covered by its partially open content model`
-  if (type === 'PROPERTY_ADDED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL')
+  if (has('PROPERTY_ADDED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', 'ITEM_ADDED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL'))
     return `The ${a} schema has a property or item at path '${path}' which is missing in the ${b} schema and is not covered by its partially open content model`
   return `${type} at path '${path}'`
 }
@@ -147,16 +177,16 @@ function description(type: string, path: string, a: string, b: string): string {
  */
 export function checkJsonSchema(reader: unknown, writer: unknown, newer: Side, policy: JsonPolicy = 'STRICT'): Issue[] {
   const ctx: Ctx = { origDoc: writer, updDoc: reader, newer, policy, out: [], stack: new Set() }
-  compare(ctx, { s: writer, ptr: '' }, { s: reader, ptr: '' })
+  compare(ctx, { s: writer, ptr: '', path: '' }, { s: reader, ptr: '', path: '' })
   return ctx.out
 }
 
 function add(ctx: Ctx, type: string, o: Node, u: Node, info?: string, fix?: Fix) {
   const compatible = SETS[ctx.policy].has(type)
-  const ptr = u.ptr || o.ptr
+  const path = '#/' + u.path
   const newerPtr = ctx.newer === 'reader' ? u.ptr : o.ptr
   const [a, b] = ctx.newer === 'reader' ? ['new', 'old'] : ['old', 'new']
-  ctx.out.push({ type, compatible, path: '#' + ptr, field: humanOf(newerPtr), message: description(type, '#' + ptr, a, b), info, fix: compatible ? undefined : fix })
+  ctx.out.push({ type, compatible, path, field: humanOf(newerPtr), message: description(type, path, a, b), info, fix: compatible ? undefined : fix })
 }
 
 function probe(ctx: Ctx, o: Node, u: Node) {
@@ -172,16 +202,18 @@ function compare(ctx: Ctx, o0: Node, u0: Node) {
   if (o.s === undefined) return add(ctx, 'SCHEMA_ADDED', o, u, undefined, revert(ctx, o, u))
   if (u.s === undefined) return add(ctx, 'SCHEMA_REMOVED', o, u)
   const key = o.ptr + '|' + u.ptr
-  if (ctx.stack.has(key)) return // a cycle through $ref: treated as compatible
-  ctx.stack.add(key)
+  if (!o.whole && !u.whole) {
+    if (ctx.stack.has(key)) return // a cycle through $ref: treated as compatible
+    ctx.stack.add(key)
+  }
   compareTypes(ctx, o, u)
-  ctx.stack.delete(key)
+  if (!o.whole && !u.whole) ctx.stack.delete(key)
 }
 
 function compareTypes(ctx: Ctx, o: Node, u: Node) {
   const oc = combo(o.s), uc = combo(u.s)
   if (!oc && uc) {
-    const subs = uc.subs(u.ptr)
+    const subs = uc.subs(u)
     if (subs.length === 1) {
       const p = probe(ctx, o, subs[0])
       if (p.ok) return void ctx.out.push(...p.diffs)
@@ -195,7 +227,7 @@ function compareTypes(ctx: Ctx, o: Node, u: Node) {
       }
     }
   } else if (oc && !uc) {
-    const subs = oc.subs(o.ptr)
+    const subs = oc.subs(o)
     if (subs.length === 1) {
       const p = probe(ctx, subs[0], u)
       if (p.ok) return void ctx.out.push(...p.diffs)
@@ -216,44 +248,45 @@ function compareTypes(ctx: Ctx, o: Node, u: Node) {
     if (cO === 'false' || cU === 'empty') return
     return add(ctx, 'TYPE_CHANGED', o, u, `${cO} → ${cU}`, typeFix(ctx, o, u))
   }
-  if (cO === 'false' || cO === 'empty') return
+  if (cO === 'false') return
   for (const [k, t] of [['$id', 'ID_CHANGED'], ['title', 'TITLE_CHANGED'], ['description', 'DESCRIPTION_CHANGED'], ['default', 'DEFAULT_CHANGED']] as const)
     if (JSON.stringify(os[k]) !== JSON.stringify(us[k])) add(ctx, t, o, u, `${JSON.stringify(os[k]) ?? 'none'} → ${JSON.stringify(us[k]) ?? 'none'}`)
+  if (cO === 'empty') return
 
   if (cO === 'combined') return compareCombined(ctx, o, u, oc!, uc!)
   if (enumish(cO)) return compareEnum(ctx, o, u)
   if (cO === 'not') {
-    const a: Node = { s: os.not, ptr: `${o.ptr}/not` }, b: Node = { s: us.not, ptr: `${u.ptr}/not` }
     if (JSON.stringify(os.not) === JSON.stringify(us.not)) return
-    if (probe(ctx, a, b).ok) return add(ctx, 'NOT_TYPE_EXTENDED', o, u, undefined, revert(ctx, o, u))
-    if (probe(ctx, b, a).ok) return add(ctx, 'NOT_TYPE_NARROWED', o, u)
-    return add(ctx, 'TYPE_CHANGED', o, u, 'not', revert(ctx, o, u))
+    const a = kid(o, os.not, 'not'), b = kid(u, us.not, 'not')
+    // The check runs backwards: what the new schema forbids must already have been forbidden.
+    if (probe(ctx, b, a).ok) return add(ctx, 'NOT_TYPE_NARROWED', a, b)
+    return add(ctx, 'NOT_TYPE_EXTENDED', a, b, undefined, revert(ctx, o, u))
   }
   if (cO === 'string') {
-    limit(ctx, o, u, 'maxLength', 'MAX_LENGTH', 'max')
-    limit(ctx, o, u, 'minLength', 'MIN_LENGTH', 'min')
+    limit(ctx, o, u, 'maxLength', 'MAX_LENGTH')
+    limit(ctx, o, u, 'minLength', 'MIN_LENGTH')
     const a = os.pattern, b = us.pattern
     if (a !== b) {
-      const at: [Node, Node] = [{ s: a, ptr: `${o.ptr}/pattern` }, { s: b, ptr: `${u.ptr}/pattern` }]
-      if (a === undefined) add(ctx, 'PATTERN_ADDED', ...at, b, revertKey(ctx, o, u, 'pattern'))
-      else if (b === undefined) add(ctx, 'PATTERN_REMOVED', ...at)
-      else add(ctx, 'PATTERN_CHANGED', ...at, `${a} → ${b}`, revertKey(ctx, o, u, 'pattern'))
+      const nodes: [Node, Node] = [kid(o, a, 'pattern'), kid(u, b, 'pattern')]
+      if (a === undefined) add(ctx, 'PATTERN_ADDED', ...nodes, b, revertKey(ctx, o, u, 'pattern'))
+      else if (b === undefined) add(ctx, 'PATTERN_REMOVED', ...nodes)
+      else add(ctx, 'PATTERN_CHANGED', ...nodes, `${a} → ${b}`, revertKey(ctx, o, u, 'pattern'))
     }
   }
   if (cO === 'number') {
-    limit(ctx, o, u, 'maximum', 'MAXIMUM', 'max')
-    limit(ctx, o, u, 'minimum', 'MINIMUM', 'min')
-    limit(ctx, o, u, 'exclusiveMaximum', 'EXCLUSIVE_MAXIMUM', 'max')
-    limit(ctx, o, u, 'exclusiveMinimum', 'EXCLUSIVE_MINIMUM', 'min')
+    limit(ctx, o, u, 'maximum', 'MAXIMUM')
+    limit(ctx, o, u, 'minimum', 'MINIMUM')
+    limit(ctx, o, u, 'exclusiveMaximum', 'EXCLUSIVE_MAXIMUM')
+    limit(ctx, o, u, 'exclusiveMinimum', 'EXCLUSIVE_MINIMUM')
     const a = os.multipleOf, b = us.multipleOf
     if (a !== b) {
-      const at: [Node, Node] = [{ s: a, ptr: `${o.ptr}/multipleOf` }, { s: b, ptr: `${u.ptr}/multipleOf` }]
+      const nodes: [Node, Node] = [kid(o, a, 'multipleOf'), kid(u, b, 'multipleOf')]
       const fix = revertKey(ctx, o, u, 'multipleOf')
-      if (a === undefined) add(ctx, 'MULTIPLE_OF_ADDED', ...at, String(b), fix)
-      else if (b === undefined) add(ctx, 'MULTIPLE_OF_REMOVED', ...at)
-      else if (a !== 0 && b % a === 0) add(ctx, 'MULTIPLE_OF_EXPANDED', ...at, `${a} → ${b}`, fix)
-      else if (b !== 0 && a % b === 0) add(ctx, 'MULTIPLE_OF_REDUCED', ...at, `${a} → ${b}`)
-      else add(ctx, 'MULTIPLE_OF_CHANGED', ...at, `${a} → ${b}`, fix)
+      if (a === undefined) add(ctx, 'MULTIPLE_OF_ADDED', ...nodes, String(b), fix)
+      else if (b === undefined) add(ctx, 'MULTIPLE_OF_REMOVED', ...nodes)
+      else if (a !== 0 && b % a === 0) add(ctx, 'MULTIPLE_OF_EXPANDED', ...nodes, `${a} → ${b}`, fix)
+      else if (b !== 0 && a % b === 0) add(ctx, 'MULTIPLE_OF_REDUCED', ...nodes, `${a} → ${b}`)
+      else add(ctx, 'MULTIPLE_OF_CHANGED', ...nodes, `${a} → ${b}`, fix)
     }
     if ((os.type === 'integer') !== (us.type === 'integer')) {
       if (os.type === 'integer') add(ctx, 'TYPE_EXTENDED', o, u, 'integer → number')
@@ -265,38 +298,63 @@ function compareTypes(ctx: Ctx, o: Node, u: Node) {
 }
 
 function compareEnum(ctx: Ctx, o: Node, u: Node) {
+  const os = single(o.s), us = single(u.s)
   const vals = (s: any): string[] => (Array.isArray(s.enum) ? s.enum : [s.const]).map((x: unknown) => JSON.stringify(x))
-  const a = vals(single(o.s)), b = vals(single(u.s))
-  const same = a.length === b.length && a.every((x) => b.includes(x))
-  if (same) return
-  const at: [Node, Node] = [{ s: o.s.enum, ptr: `${o.ptr}/enum` }, { s: u.s.enum, ptr: `${u.ptr}/enum` }]
+  const a = vals(os), b = vals(us)
+  if (a.length === b.length && a.every((x) => b.includes(x))) return
   const removed = a.filter((x) => !b.includes(x)), added = b.filter((x) => !a.includes(x))
-  if (a.every((x) => b.includes(x))) add(ctx, 'ENUM_ARRAY_EXTENDED', ...at, `added ${added.join(', ')}`)
-  else if (b.every((x) => a.includes(x))) add(ctx, 'ENUM_ARRAY_NARROWED', ...at, `removed ${removed.join(', ')}`, enumFix(ctx, o, u, removed, added))
-  else add(ctx, 'ENUM_ARRAY_CHANGED', ...at, `removed ${removed.join(', ')}; added ${added.join(', ')}`, enumFix(ctx, o, u, removed, added))
+  if (!Array.isArray(os.enum) && !Array.isArray(us.enum))
+    return add(ctx, 'ENUM_ARRAY_CHANGED', kid(o, os.const, 'const'), kid(u, us.const, 'const'), `${a[0]} → ${b[0]}`, revert(ctx, o, u))
+  const nodes: [Node, Node] = [kid(o, os.enum, 'enum'), kid(u, us.enum, 'enum')]
+  if (!removed.length) add(ctx, 'ENUM_ARRAY_EXTENDED', ...nodes, `added ${added.join(', ')}`)
+  else if (!added.length) add(ctx, 'ENUM_ARRAY_NARROWED', ...nodes, `removed ${removed.join(', ')}`, enumFix(ctx, o, u, removed, added))
+  else add(ctx, 'ENUM_ARRAY_CHANGED', ...nodes, `removed ${removed.join(', ')}; added ${added.join(', ')}`, enumFix(ctx, o, u, removed, added))
+}
+
+/** unevaluatedProperties / unevaluatedItems as the registry classes them: absent, false, empty (true or {}), or a schema. */
+const uneval = (v: unknown) => (v === undefined ? 'absent' : v === false ? 'false' : v === true || (typeof v === 'object' && v !== null && !Object.keys(v).length) ? 'empty' : 'schema')
+const schemaOf = (v: unknown) => (v && typeof v === 'object' && Object.keys(v).length ? v : null)
+
+function compareUnevaluated(ctx: Ctx, o: Node, u: Node, key: 'unevaluatedProperties' | 'unevaluatedItems') {
+  const base = key === 'unevaluatedItems' ? 'UNEVALUATED_ITEMS' : 'UNEVALUATED_PROPERTIES'
+  const a = single(o.s)[key], b = single(u.s)[key]
+  const ka = uneval(a), kb = uneval(b)
+  if (ka === 'absent' && kb === 'absent') return
+  const nodes: [Node, Node] = [kid(o, a, key), kid(u, b, key)]
+  const fix = revertKey(ctx, o, u, key)
+  if (ka === 'absent') add(ctx, kb === 'false' ? `${base}_REMOVED` : `${base}_NARROWED`, ...nodes, undefined, fix)
+  else if (kb === 'absent') add(ctx, ka === 'false' ? `${base}_ADDED` : `${base}_EXTENDED`, ...nodes, undefined, fix)
+  else if (ka === 'false' && kb !== 'false') add(ctx, `${base}_ADDED`, ...nodes)
+  else if (ka !== 'false' && kb === 'false') add(ctx, `${base}_REMOVED`, ...nodes, undefined, fix)
+  else if (ka === 'empty' && kb !== 'empty') add(ctx, `${base}_NARROWED`, ...nodes, undefined, fix)
+  else if (ka !== 'empty' && kb === 'empty') add(ctx, `${base}_EXTENDED`, ...nodes)
+  else compare(ctx, ...nodes)
 }
 
 function compareObject(ctx: Ctx, o: Node, u: Node) {
   const os = single(o.s), us = single(u.s)
   const permits = (s: any) => s.additionalProperties !== false
-  const apSchema = (s: any) => (s.additionalProperties && typeof s.additionalProperties === 'object' && Object.keys(s.additionalProperties).length ? s.additionalProperties : null)
-  const open = (s: any) => permits(s) && !apSchema(s) && !Object.keys(s.patternProperties ?? {}).length
-  const partial = (s: any, name: string): Node | null => {
-    for (const [p, v] of Object.entries(s.patternProperties ?? {})) if (new RegExp(p).test(name)) return { s: v, ptr: `/patternProperties/${esc(p)}` }
-    return apSchema(s) ? { s: apSchema(s), ptr: '/additionalProperties' } : null
+  const apSchema = (s: any) => schemaOf(s.additionalProperties)
+  const open = (s: any) => permits(s) && !apSchema(s) && !Object.keys(s.patternProperties ?? {}).length && ['absent', 'empty'].includes(uneval(s.unevaluatedProperties))
+  const partial = (n: Node, s: any, name: string, path: string): Node | null => {
+    for (const [p, v] of Object.entries(s.patternProperties ?? {})) if (new RegExp(p).test(name)) return { s: v, ptr: `${n.ptr}/patternProperties/${esc(p)}`, path }
+    if (apSchema(s)) return { s: apSchema(s), ptr: `${n.ptr}/additionalProperties`, path }
+    if (permits(s) && uneval(s.unevaluatedProperties) === 'schema') return { s: s.unevaluatedProperties, ptr: `${n.ptr}/unevaluatedProperties`, path }
+    return null
   }
   const op = os.properties ?? {}, up = us.properties ?? {}
   const oreq: string[] = os.required ?? [], ureq: string[] = us.required ?? []
-  const propO = (n: string): Node => ({ s: op[n], ptr: `${o.ptr}/properties/${esc(n)}` })
-  const propU = (n: string): Node => ({ s: up[n], ptr: `${u.ptr}/properties/${esc(n)}` })
+  const propO = (n: string): Node => ({ s: op[n], ptr: `${o.ptr}/properties/${esc(n)}`, path: join(o.path, `properties/${n}`) })
+  const propU = (n: string): Node => ({ s: up[n], ptr: `${u.ptr}/properties/${esc(n)}`, path: join(u.path, `properties/${n}`) })
 
   for (const n of Object.keys(op)) {
     if (!(n in up)) continue
     const req = ureq.includes(n), was = oreq.includes(n)
-    if (was && !req) add(ctx, 'REQUIRED_ATTRIBUTE_REMOVED', propO(n), propU(n), n)
+    const a = at(propO(n), join(o.path, `required/${n}`)), b = at(propU(n), join(u.path, `required/${n}`))
+    if (was && !req) add(ctx, 'REQUIRED_ATTRIBUTE_REMOVED', a, b, n)
     else if (!was && req) {
-      if (hasDefault(deref(ctx.updDoc, propU(n)).s)) add(ctx, 'REQUIRED_ATTRIBUTE_WITH_DEFAULT_ADDED', propO(n), propU(n), n)
-      else add(ctx, 'REQUIRED_ATTRIBUTE_ADDED', propO(n), propU(n), n, requiredFix(ctx, o, u, n))
+      if (hasDefault(deref(ctx.updDoc, propU(n)).s)) add(ctx, 'REQUIRED_ATTRIBUTE_WITH_DEFAULT_ADDED', a, b, n)
+      else add(ctx, 'REQUIRED_ATTRIBUTE_ADDED', a, b, n, requiredFix(ctx, o, u, n))
     }
   }
   for (const n of [...new Set([...Object.keys(op), ...Object.keys(up)])]) {
@@ -304,9 +362,10 @@ function compareObject(ctx: Ctx, o: Node, u: Node) {
     if (!(n in up)) {
       if (open(us)) add(ctx, 'PROPERTY_REMOVED_FROM_OPEN_CONTENT_MODEL', a, b, n)
       else {
-        const par = partial(us, n)
+        const par = partial(u, us, n, a.path)
         if (par) {
-          const p = probe(ctx, a, { s: par.s, ptr: u.ptr + par.ptr })
+          const p = probe(ctx, a, par)
+          ctx.out.push(...p.diffs.map((d) => ({ ...d, fix: undefined })))
           add(ctx, p.ok ? 'PROPERTY_REMOVED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL' : 'PROPERTY_REMOVED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', a, b, n, restore(ctx, o, u, n))
         } else if (op[n] === false) add(ctx, 'PROPERTY_WITH_FALSE_REMOVED_FROM_CLOSED_CONTENT_MODEL', a, b, n)
         else add(ctx, 'PROPERTY_REMOVED_FROM_CLOSED_CONTENT_MODEL', a, b, n, restore(ctx, o, u, n))
@@ -317,9 +376,10 @@ function compareObject(ctx: Ctx, o: Node, u: Node) {
         if (classOf(up[n]) === 'empty') add(ctx, 'PROPERTY_WITH_EMPTY_SCHEMA_ADDED_TO_OPEN_CONTENT_MODEL', a, b, n)
         else add(ctx, req ? (def ? 'REQUIRED_PROPERTY_WITH_DEFAULT_ADDED_TO_OPEN_CONTENT_MODEL' : 'REQUIRED_PROPERTY_ADDED_TO_OPEN_CONTENT_MODEL') : 'OPTIONAL_PROPERTY_ADDED_TO_OPEN_CONTENT_MODEL', a, b, n, openAddFix(ctx, o, u, n))
       } else {
-        const par = partial(os, n)
+        const par = partial(o, os, n, b.path)
         if (par) {
-          const p = probe(ctx, { s: par.s, ptr: o.ptr + par.ptr }, b)
+          const p = probe(ctx, par, b)
+          ctx.out.push(...p.diffs.map((d) => ({ ...d, fix: undefined })))
           add(ctx, p.ok ? 'PROPERTY_ADDED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL' : 'PROPERTY_ADDED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', a, b, n, restore(ctx, o, u, n))
         }
         if (req) add(ctx, def ? 'REQUIRED_PROPERTY_WITH_DEFAULT_ADDED_TO_UNOPEN_CONTENT_MODEL' : 'REQUIRED_PROPERTY_ADDED_TO_UNOPEN_CONTENT_MODEL', a, b, n, requiredFix(ctx, o, u, n))
@@ -327,9 +387,8 @@ function compareObject(ctx: Ctx, o: Node, u: Node) {
       }
     } else compare(ctx, a, b)
   }
-
-  const apO: Node = { s: os.additionalProperties, ptr: `${o.ptr}/additionalProperties` }
-  const apU: Node = { s: us.additionalProperties, ptr: `${u.ptr}/additionalProperties` }
+  compareDependencies(ctx, o, u)
+  const apO = kid(o, os.additionalProperties, 'additionalProperties'), apU = kid(u, us.additionalProperties, 'additionalProperties')
   const fix = revertKey(ctx, o, u, 'additionalProperties')
   if (permits(os) !== permits(us)) {
     if (permits(us)) add(ctx, 'ADDITIONAL_PROPERTIES_ADDED', apO, apU)
@@ -337,43 +396,141 @@ function compareObject(ctx: Ctx, o: Node, u: Node) {
   } else if (!apSchema(os) && apSchema(us)) add(ctx, 'ADDITIONAL_PROPERTIES_NARROWED', apO, apU, undefined, fix)
   else if (apSchema(os) && !apSchema(us)) add(ctx, 'ADDITIONAL_PROPERTIES_EXTENDED', apO, apU)
   else if (apSchema(os)) compare(ctx, apO, apU)
-  limit(ctx, o, u, 'maxProperties', 'MAX_PROPERTIES', 'max')
-  limit(ctx, o, u, 'minProperties', 'MIN_PROPERTIES', 'min')
+  compareUnevaluated(ctx, o, u, 'unevaluatedProperties')
+  limit(ctx, o, u, 'maxProperties', 'MAX_PROPERTIES')
+  limit(ctx, o, u, 'minProperties', 'MIN_PROPERTIES')
+}
+
+/**
+ * "If property X is present then ..." rules. Draft 4-7 keep both kinds under `dependencies`;
+ * 2019-09 and later split them into dependentRequired (name lists) and dependentSchemas.
+ */
+function compareDependencies(ctx: Ctx, o: Node, u: Node) {
+  const read = (n: Node) => {
+    const s = single(n.s)
+    const lists: Record<string, { v: string[]; key: string }> = {}, schemas: Record<string, { v: unknown; key: string }> = {}
+    for (const [k, v] of Object.entries(s.dependencies ?? {})) (Array.isArray(v) ? lists : schemas)[k] = { v: v as any, key: 'dependencies' }
+    for (const [k, v] of Object.entries(s.dependentRequired ?? {})) lists[k] = { v: v as string[], key: 'dependentRequired' }
+    for (const [k, v] of Object.entries(s.dependentSchemas ?? {})) schemas[k] = { v, key: 'dependentSchemas' }
+    return { lists, schemas }
+  }
+  const a = read(o), b = read(u)
+  const node = (n: Node, e: { v: unknown; key: string } | undefined, k: string): Node => ({ s: e?.v, ptr: `${n.ptr}/${e?.key ?? 'dependencies'}/${esc(k)}`, path: join(n.path, `dependencies/${k}`) })
+  // Restoring the old rule on the newer side undoes either kind of change.
+  const fixFor = (k: string, oe?: { v: unknown; key: string }, ue?: { v: unknown; key: string }): Fix => {
+    const [mine, theirs, n] = ctx.newer === 'reader' ? [ue, oe, u] : [oe, ue, o]
+    const ptr = `${n.ptr}/${(mine ?? theirs)!.key}/${esc(k)}`
+    if (!theirs) return { label: `Remove the dependency on '${k}' from the new version`, ops: [{ op: 'remove', ptr }] }
+    if (!mine) return { label: `Restore the dependency on '${k}'`, ops: [{ op: 'set', ptr: `${n.ptr}/${theirs.key}`, value: { ...(single(n.s)[theirs.key] ?? {}), [k]: theirs.v } }] }
+    return { label: `Restore the dependency on '${k}'`, ops: [{ op: 'set', ptr, value: theirs.v }] }
+  }
+  for (const k of new Set([...Object.keys(a.lists), ...Object.keys(b.lists)])) {
+    const x = a.lists[k], y = b.lists[k]
+    const nodes: [Node, Node] = [node(o, x, k), node(u, y, k)]
+    if (!y) add(ctx, 'DEPENDENCY_ARRAY_REMOVED', ...nodes, k)
+    else if (!x) add(ctx, 'DEPENDENCY_ARRAY_ADDED', ...nodes, k, fixFor(k, x, y))
+    else {
+      const more = y.v.filter((p) => !x.v.includes(p)), fewer = x.v.filter((p) => !y.v.includes(p))
+      if (!more.length && !fewer.length) continue
+      if (!fewer.length) add(ctx, 'DEPENDENCY_ARRAY_EXTENDED', ...nodes, `also requires ${more.join(', ')}`, fixFor(k, x, y))
+      else if (!more.length) add(ctx, 'DEPENDENCY_ARRAY_NARROWED', ...nodes, `no longer requires ${fewer.join(', ')}`)
+      else add(ctx, 'DEPENDENCY_ARRAY_CHANGED', ...nodes, `${x.v.join(', ')} → ${y.v.join(', ')}`, fixFor(k, x, y))
+    }
+  }
+  for (const k of new Set([...Object.keys(a.schemas), ...Object.keys(b.schemas)])) {
+    const x = a.schemas[k], y = b.schemas[k]
+    const nodes: [Node, Node] = [node(o, x, k), node(u, y, k)]
+    if (!y) add(ctx, 'DEPENDENCY_SCHEMA_REMOVED', ...nodes, k)
+    else if (!x) add(ctx, 'DEPENDENCY_SCHEMA_ADDED', ...nodes, k, fixFor(k, x, y))
+    else compare(ctx, ...nodes)
+  }
 }
 
 function compareArray(ctx: Ctx, o: Node, u: Node) {
   const os = single(o.s), us = single(u.s)
-  const tuple = (s: any): any[] | null => s.prefixItems ?? (Array.isArray(s.items) ? s.items : null)
-  const tO = tuple(os), tU = tuple(us)
-  const key = (s: any) => (s.prefixItems ? 'prefixItems' : 'items')
-  if (!tO && !tU) {
-    if (os.items !== undefined || us.items !== undefined) compare(ctx, { s: os.items ?? true, ptr: `${o.ptr}/items` }, { s: us.items ?? true, ptr: `${u.ptr}/items` })
-  } else if (tO && tU) {
-    const addO = os.additionalItems !== false, addU = us.additionalItems !== false
-    for (let i = 0; i < Math.max(tO.length, tU.length); i++) {
-      const a: Node = { s: tO[i], ptr: `${o.ptr}/${key(os)}/${i}` }, b: Node = { s: tU[i], ptr: `${u.ptr}/${key(us)}/${i}` }
-      if (i >= tO.length) add(ctx, addO ? (classOf(tU[i]) === 'empty' ? 'ITEM_WITH_EMPTY_SCHEMA_ADDED_TO_OPEN_CONTENT_MODEL' : 'ITEM_ADDED_TO_OPEN_CONTENT_MODEL') : 'ITEM_ADDED_TO_CLOSED_CONTENT_MODEL', a, b, String(i), revert(ctx, a, b))
-      else if (i >= tU.length) add(ctx, addU ? 'ITEM_REMOVED_FROM_OPEN_CONTENT_MODEL' : 'ITEM_REMOVED_FROM_CLOSED_CONTENT_MODEL', a, b, String(i), revert(ctx, a, b))
-      else compare(ctx, a, b)
+  // Three shapes of the same idea: draft 4-2019 `items: [..]` + additionalItems, 2020-12 prefixItems + items,
+  // and a plain `items` schema for every element.
+  const shape = (s: any) => {
+    const tupleKey = s.prefixItems ? 'prefixItems' : Array.isArray(s.items) ? 'items' : null
+    const restKey = s.prefixItems ? 'items' : 'additionalItems'
+    const rest = tupleKey ? s[restKey] : s.prefixItems ? s.items : s.additionalItems
+    return {
+      tupleKey, restKey,
+      tuple: (tupleKey ? s[tupleKey] : []) as unknown[],
+      all: tupleKey || s.items === undefined ? undefined : s.items,
+      rest,
+      permits: rest !== false,
+      restSchema: schemaOf(rest),
     }
-    if (addO !== addU) {
-      const at: [Node, Node] = [{ s: os.additionalItems, ptr: `${o.ptr}/additionalItems` }, { s: us.additionalItems, ptr: `${u.ptr}/additionalItems` }]
-      if (addU) add(ctx, 'ADDITIONAL_ITEMS_ADDED', ...at)
-      else add(ctx, 'ADDITIONAL_ITEMS_REMOVED', ...at, undefined, revertKey(ctx, o, u, 'additionalItems'))
+  }
+  const A = shape(os), B = shape(us)
+  const isOpen = (x: typeof A, s: any) => x.permits && !x.restSchema && ['absent', 'empty'].includes(uneval(s.unevaluatedItems))
+  const partial = (x: typeof A, n: Node, s: any, path: string): Node | null =>
+    x.restSchema ? { s: x.restSchema, ptr: `${n.ptr}/${x.restKey}`, path }
+    : x.permits && uneval(s.unevaluatedItems) === 'schema' ? { s: s.unevaluatedItems, ptr: `${n.ptr}/unevaluatedItems`, path }
+    : null
+
+  compare(ctx, kid(o, A.all, 'items'), kid(u, B.all, 'items'))
+
+  for (let i = 0; i < Math.max(A.tuple.length, B.tuple.length); i++) {
+    const path = join(u.path, `items/${i}`)
+    const a: Node = { s: A.tuple[i], ptr: `${o.ptr}/${A.tupleKey ?? 'items'}/${i}`, path }
+    const b: Node = { s: B.tuple[i], ptr: `${u.ptr}/${B.tupleKey ?? 'items'}/${i}`, path }
+    // Undoing a tuple change means putting the whole old tuple back on the newer side.
+    const [nNode, oShape, nShape] = ctx.newer === 'reader' ? [u, A, B] : [o, B, A]
+    const fix: Fix | undefined = oShape.tupleKey
+      ? { label: 'Restore the previous list of item schemas', ops: [{ op: 'set', ptr: `${nNode.ptr}/${nShape.tupleKey ?? oShape.tupleKey}`, value: oShape.tuple }] }
+      : undefined
+    if (i < A.tuple.length && i < B.tuple.length) compare(ctx, a, b)
+    else if (i >= B.tuple.length) {
+      if (isOpen(B, us)) add(ctx, 'ITEM_REMOVED_FROM_OPEN_CONTENT_MODEL', a, b, String(i))
+      else {
+        const par = partial(B, u, us, path)
+        if (par) {
+          const p = probe(ctx, a, par)
+          ctx.out.push(...p.diffs.map((d) => ({ ...d, fix: undefined })))
+          add(ctx, p.ok ? 'ITEM_REMOVED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL' : 'ITEM_REMOVED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', a, b, String(i), fix)
+        } else add(ctx, A.tuple[i] === false ? 'ITEM_WITH_FALSE_REMOVED_FROM_CLOSED_CONTENT_MODEL' : 'ITEM_REMOVED_FROM_CLOSED_CONTENT_MODEL', a, b, String(i), fix)
+      }
+    } else if (isOpen(A, os)) add(ctx, classOf(B.tuple[i]) === 'empty' ? 'ITEM_WITH_EMPTY_SCHEMA_ADDED_TO_OPEN_CONTENT_MODEL' : 'ITEM_ADDED_TO_OPEN_CONTENT_MODEL', a, b, String(i), fix)
+    else {
+      const par = partial(A, o, os, path)
+      if (par) {
+        const p = probe(ctx, par, b)
+        ctx.out.push(...p.diffs.map((d) => ({ ...d, fix: undefined })))
+        add(ctx, p.ok ? 'ITEM_ADDED_IS_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL' : 'ITEM_ADDED_NOT_COVERED_BY_PARTIALLY_OPEN_CONTENT_MODEL', a, b, String(i), fix)
+      } else add(ctx, 'ITEM_ADDED_TO_CLOSED_CONTENT_MODEL', a, b, String(i))
     }
-  } else add(ctx, 'TYPE_CHANGED', o, u, 'list items ↔ tuple items', revert(ctx, o, u))
-  limit(ctx, o, u, 'maxItems', 'MAX_ITEMS', 'max')
-  limit(ctx, o, u, 'minItems', 'MIN_ITEMS', 'min')
+  }
+
+  const restO: Node = { s: A.rest, ptr: `${o.ptr}/${A.restKey}`, path: join(o.path, 'additionalItems') }
+  const restU: Node = { s: B.rest, ptr: `${u.ptr}/${B.restKey}`, path: join(u.path, 'additionalItems') }
+  const [nShape, oShape, nNode] = ctx.newer === 'reader' ? [B, A, u] : [A, B, o]
+  const restFix: Fix = oShape.rest === undefined
+    ? { label: `Remove "${nShape.restKey}" from the new version`, ops: [{ op: 'remove', ptr: `${nNode.ptr}/${nShape.restKey}` }] }
+    : { label: `Restore "${nShape.restKey}": ${JSON.stringify(oShape.rest)}`, ops: [{ op: 'set', ptr: `${nNode.ptr}/${nShape.restKey}`, value: oShape.rest }] }
+  if (A.permits !== B.permits) {
+    if (B.permits) add(ctx, 'ADDITIONAL_ITEMS_ADDED', restO, restU)
+    else add(ctx, 'ADDITIONAL_ITEMS_REMOVED', restO, restU, undefined, restFix)
+  } else if (!A.restSchema && B.restSchema) add(ctx, 'ADDITIONAL_ITEMS_NARROWED', restO, restU, undefined, restFix)
+  else if (A.restSchema && !B.restSchema) add(ctx, 'ADDITIONAL_ITEMS_EXTENDED', restO, restU)
+  else if (A.restSchema) compare(ctx, { ...restO, s: A.restSchema }, { ...restU, s: B.restSchema })
+
+  compareUnevaluated(ctx, o, u, 'unevaluatedItems')
+  limit(ctx, o, u, 'maxItems', 'MAX_ITEMS')
+  limit(ctx, o, u, 'minItems', 'MIN_ITEMS')
+  limit(ctx, o, u, 'maxContains', 'MAX_CONTAINS')
+  limit(ctx, o, u, 'minContains', 'MIN_CONTAINS')
   if (!!os.uniqueItems !== !!us.uniqueItems) {
-    const at: [Node, Node] = [{ s: os.uniqueItems, ptr: `${o.ptr}/uniqueItems` }, { s: us.uniqueItems, ptr: `${u.ptr}/uniqueItems` }]
-    if (us.uniqueItems) add(ctx, 'UNIQUE_ITEMS_ADDED', ...at, undefined, revertKey(ctx, o, u, 'uniqueItems'))
-    else add(ctx, 'UNIQUE_ITEMS_REMOVED', ...at)
+    const nodes: [Node, Node] = [kid(o, os.uniqueItems, 'uniqueItems'), kid(u, us.uniqueItems, 'uniqueItems')]
+    if (us.uniqueItems) add(ctx, 'UNIQUE_ITEMS_ADDED', ...nodes, undefined, revertKey(ctx, o, u, 'uniqueItems'))
+    else add(ctx, 'UNIQUE_ITEMS_REMOVED', ...nodes)
   }
 }
 
-function compareCombined(ctx: Ctx, o: Node, u: Node, oc: NonNullable<ReturnType<typeof combo>>, uc: NonNullable<ReturnType<typeof combo>>) {
+function compareCombined(ctx: Ctx, o: Node, u: Node, oc: Combo, uc: Combo) {
   const unique = (ns: Node[]) => ns.filter((n, i) => ns.findIndex((m) => JSON.stringify(m.s) === JSON.stringify(n.s)) === i)
-  const a = unique(oc.subs(o.ptr)), b = unique(uc.subs(u.ptr))
+  const a = unique(oc.subs(o)), b = unique(uc.subs(u))
   if (oc.crit !== uc.crit) {
     const widen = uc.crit === 'anyOf' || (a.length === 1 && b.length === 1) || (a.length === 1 && uc.crit === 'oneOf') || (b.length === 1 && oc.crit === 'allOf')
     if (!widen) return add(ctx, 'COMBINED_TYPE_CHANGED', o, u, `${oc.crit} → ${uc.crit}`, revert(ctx, o, u))
@@ -384,10 +541,19 @@ function compareCombined(ctx: Ctx, o: Node, u: Node, oc: NonNullable<ReturnType<
   else if (a.length > b.length) add(ctx, oc.crit === 'allOf' ? 'PRODUCT_TYPE_NARROWED' : 'SUM_TYPE_NARROWED', o, u, `${a.length} → ${b.length} subschemas`, fix)
 
   // Maximum bipartite matching over compatible subschema pairs (Kuhn's augmenting paths).
-  const edges = a.map((x) => b.map((y) => probe(ctx, x, y)))
+  // Differences inside a pair are reported under the original side's keyword and index.
+  const edges = a.map((x, i) => {
+    const path = join(o.path, `${oc.crit}/${i}`)
+    return b.map((y) => probe(ctx, at(x, path), at(y, path)))
+  })
   const matchB = new Array<number>(b.length).fill(-1)
+  // Try an unchanged subschema first, so an untouched branch is paired with itself, not with a look-alike.
+  const order = a.map((x) => {
+    const same = b.findIndex((y) => JSON.stringify(y.s) === JSON.stringify(x.s))
+    return same < 0 ? b.map((_, j) => j) : [same, ...b.map((_, j) => j).filter((j) => j !== same)]
+  })
   const augment = (i: number, seen: Set<number>): boolean => {
-    for (let j = 0; j < b.length; j++) {
+    for (const j of order[i]) {
       if (!edges[i][j].ok || seen.has(j)) continue
       seen.add(j)
       if (matchB[j] < 0 || augment(matchB[j], seen)) {
@@ -405,16 +571,18 @@ function compareCombined(ctx: Ctx, o: Node, u: Node, oc: NonNullable<ReturnType<
   if (matched < Math.min(a.length, b.length)) add(ctx, 'COMBINED_TYPE_SUBSCHEMAS_CHANGED', o, u, undefined, fix)
 }
 
-function limit(ctx: Ctx, o: Node, u: Node, key: string, base: string, _sense: 'max' | 'min') {
+function limit(ctx: Ctx, o: Node, u: Node, key: string, base: string) {
   const a = single(o.s)[key], b = single(u.s)[key]
   if (a === b || typeof a === 'boolean' || typeof b === 'boolean') return
   const t = a === undefined ? `${base}_ADDED` : b === undefined ? `${base}_REMOVED` : b > a ? `${base}_INCREASED` : `${base}_DECREASED`
-  add(ctx, t, { s: a, ptr: `${o.ptr}/${key}` }, { s: b, ptr: `${u.ptr}/${key}` }, `${a ?? 'none'} → ${b ?? 'none'}`, revertKey(ctx, o, u, key))
+  add(ctx, t, kid(o, a, key), kid(u, b, key), `${a ?? 'none'} → ${b ?? 'none'}`, revertKey(ctx, o, u, key))
 }
 
 // ---- fixes: always edit the newer document ----
 
-function revert(ctx: Ctx, o: Node, u: Node): Fix {
+function revert(ctx: Ctx, o0: Node, u0: Node): Fix {
+  // A synthetic part cannot be replaced on its own: revert the schema it was split from.
+  const o = o0.whole ?? o0, u = u0.whole ?? u0
   const [nPtr, oVal] = ctx.newer === 'reader' ? [u.ptr, o.s] : [o.ptr, u.s]
   return { label: 'Revert this subschema to the previous version', ops: [oVal === undefined ? { op: 'remove', ptr: nPtr } : { op: 'set', ptr: nPtr, value: oVal }] }
 }
@@ -466,7 +634,7 @@ function zeroFor(s: any): unknown {
 
 function requiredFix(ctx: Ctx, o: Node, u: Node, name: string): Fix {
   if (ctx.newer === 'reader') {
-    const p = deref(ctx.updDoc, { s: u.s.properties?.[name], ptr: `${u.ptr}/properties/${esc(name)}` })
+    const p = deref(ctx.updDoc, { s: u.s.properties?.[name], ptr: `${u.ptr}/properties/${esc(name)}`, path: '' })
     if (p.s && typeof p.s === 'object') {
       const v = zeroFor(p.s)
       return { label: `Add "default": ${JSON.stringify(v)} to '${name}'`, ops: [{ op: 'set', ptr: `${p.ptr}/default`, value: v }] }

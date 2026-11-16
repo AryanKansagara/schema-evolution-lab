@@ -322,7 +322,8 @@ export function checkProto(reader: ProtoFile, writer: ProtoFile, newer: Side): I
   return ctx.out
 }
 
-function add(ctx: Ctx, type: string, path: string, field: string, info?: string, fix?: Fix) {
+function add(ctx: Ctx, type: string, rawPath: string, field: string, info?: string, fix?: Fix) {
+  const path = rawPath.replace(/\./g, "/") // nested messages are path segments, as in the registry
   const compatible = COMPATIBLE_CHANGES.has(type)
   const [a, b] = ctx.newer === 'reader' ? ['new', 'old'] : ['old', 'new']
   ctx.out.push({ type, compatible, path, field, message: compatible ? `${type} at path '${path}'` : description(type, path, a, b), info, fix })
