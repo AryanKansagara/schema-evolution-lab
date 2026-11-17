@@ -78,8 +78,7 @@ export function Footer({ wide }: { wide?: boolean }) {
   return (
     <footer className={'footer' + (wide ? ' lab-foot' : '')}>
       <div className="wrap">
-        <Link href="/docs">How it works</Link> · <a href="https://github.com/AryanKansagara/schema-evolution-lab">Source</a> · Built by Aryan Kansagara. Independent project, not
-        affiliated with Confluent.
+        <Link href="/docs">How it works</Link> · <a href="https://github.com/AryanKansagara/schema-evolution-lab">Source</a> · Built by Aryan Kansagara.
       </div>
     </footer>
   )
