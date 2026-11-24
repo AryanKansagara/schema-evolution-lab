@@ -29,7 +29,15 @@ npm install
 npm run dev     # http://localhost:4313
 npm test
 npm run build
+npm run test:e2e
 ```
+
+The end-to-end suite lives in `e2e/` (Playwright, Chromium). `npm run test:e2e` builds the app and runs the suite against
+the production build served by `vite preview` on port 4331; set `E2E_PORT` to use another. Install the browser once with
+`npx playwright install chromium`. The tests are signed out, block every request that is not for the local server (web fonts
+included) and fail on uncaught page errors. GitHub Actions (`.github/workflows/ci.yml`, job `test`) runs `npm ci`, build,
+unit tests and E2E on every pull request and push to `main`, and caches the Chromium download by Playwright version.
+Only `main` is deployed to Vercel (`git.deploymentEnabled` in `vercel.json`), so pull request branches get no preview and CI is the gate.
 
 ## Checked against the registry
 
