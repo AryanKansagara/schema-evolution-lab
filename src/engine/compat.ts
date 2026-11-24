@@ -20,7 +20,7 @@ export interface Subject {
 
 export type Parsed =
   | { ok: true; schema: AvroSchema | ProtoFile | unknown; warnings: string[] }
-  | { ok: false; error: string }
+  | { ok: false; error: string; stage?: 'parse' | 'analysis' }
 
 export function parseVersion(format: Format, text: string): Parsed {
   try {
@@ -71,17 +71,53 @@ export function modePairs(k: number, mode: Mode): { reader: number; writer: numb
   return out
 }
 
-export function analyze(subject: Pick<Subject, 'format' | 'versions' | 'policy'>): Analysis {
+export interface AnalyzeOptions {
+  checkPair?: typeof checkPair
+}
+
+export function analyze(subject: Pick<Subject, 'format' | 'versions' | 'policy'>, opts?: AnalyzeOptions): Analysis {
   const { format, versions, policy } = subject
-  const parsed = versions.map((v) => parseVersion(format, v.text))
+  const runCheck = opts?.checkPair ?? checkPair
+  const parsed: Parsed[] = versions.map((v) => parseVersion(format, v.text))
+  const msgOf = (e: unknown) => (e instanceof Error ? e.message : String(e)) || 'Analysis failed'
+  // Self-check each parsed version first so a broken schema is attributed to its own version.
+  for (let i = 0; i < parsed.length; i++) {
+    const p = parsed[i]
+    if (!p.ok) continue
+    try {
+      runCheck(format, p.schema, p.schema, 'reader', policy)
+    } catch (e) {
+      parsed[i] = { ok: false, error: msgOf(e), stage: 'analysis' }
+    }
+  }
   const memo = new Map<string, Issue[] | null>()
-  const pair = (r: number, w: number) => {
+  const pair = (r: number, w: number): Issue[] | null => {
     const key = `${r}|${w}`
     if (!memo.has(key)) {
       const a = parsed[r], b = parsed[w]
-      memo.set(key, a?.ok && b?.ok ? checkPair(format, a.schema, b.schema, r >= w ? 'reader' : 'writer', policy) : null)
+      if (!a?.ok || !b?.ok) {
+        memo.set(key, null)
+      } else {
+        try {
+          memo.set(key, runCheck(format, a.schema, b.schema, r >= w ? 'reader' : 'writer', policy))
+        } catch (e) {
+          const idx = Math.max(r, w)
+          if (parsed[idx]?.ok) parsed[idx] = { ok: false, error: msgOf(e), stage: 'analysis' }
+          memo.set(key, null)
+        }
+      }
     }
     return memo.get(key)!
+  }
+  // Eagerly populate pairs so any unexpected failure marks its version before UI components render.
+  for (let r = 0; r < parsed.length; r++) {
+    for (let w = 0; w < parsed.length; w++) {
+      if (r !== w && parsed[r]?.ok && parsed[w]?.ok) pair(r, w)
+    }
+  }
+  for (const key of memo.keys()) {
+    const [r, w] = key.split('|').map(Number)
+    if (!parsed[r]?.ok || !parsed[w]?.ok) memo.set(key, null)
   }
   const checks = (k: number, mode: Mode): ModeCheck[] => modePairs(k, mode).map(({ reader, writer }) => ({ reader, writer, issues: pair(reader, writer) ?? [] }))
   const verdict: Analysis['verdict'] = (k, mode) => {

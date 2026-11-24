@@ -435,3 +435,50 @@ test('the pages load without network access and without uncaught errors', async 
   // Web fonts are the only thing the pages ask for; the fixture blocked them and fails on any other host.
   expect(watched.blocked.length).toBeGreaterThan(0)
 })
+
+test.describe('wrong-typed JSON Schema keywords (issue #2)', () => {
+  const MUTATIONS: { label: string; mutate: (doc: any) => void }[] = [
+    { label: 'properties: 5', mutate: (d) => { d.properties = 5 } },
+    { label: 'properties.id: 5', mutate: (d) => { d.properties.id = 5 } },
+    { label: 'properties.id: null', mutate: (d) => { d.properties.id = null } },
+    { label: 'required: 5', mutate: (d) => { d.required = 5 } },
+  ]
+
+  for (const m of MUTATIONS) {
+    test(`User profile v2 with ${m.label} shows a parse error and keeps the page alive`, async ({ page }) => {
+      await openSample(page, 'User profile')
+      await timelineNode(page, 2).click()
+      const good = await editor(page, 2).inputValue()
+      const doc = JSON.parse(good)
+      m.mutate(doc)
+      await editor(page, 2).fill(JSON.stringify(doc, null, 2))
+
+      await expect(page.locator('#root > *').first()).toBeVisible()
+      await expect(page.locator('.editor-status.err')).toContainText('Does not parse')
+      await expect(summary(page)).toContainText('1 version does not parse')
+      for (const mode of MODES) await expect(cell(page, 2, mode)).toHaveAccessibleName(`v2 under ${mode}: does not parse`)
+
+      // Repairing recovers cleanly.
+      await editor(page, 2).fill(good)
+      await expect(summary(page)).toContainText('v2, v3, v4 rejected under BACKWARD')
+    })
+  }
+
+  test('a shared link carrying a wrong-typed JSON Schema fails closed instead of blanking the page', async ({ page, newPage }) => {
+    await openSample(page, 'User profile')
+    await timelineNode(page, 2).click()
+    const doc = JSON.parse(await editor(page, 2).inputValue())
+    doc.properties = 5
+    await editor(page, 2).fill(JSON.stringify(doc, null, 2))
+    await page.getByRole('button', { name: 'Share', exact: true }).click()
+    await expect(toast(page)).toContainText('Share link copied')
+    const url = await page.evaluate(() => navigator.clipboard.readText())
+
+    const other = await newPage()
+    await other.goto(url)
+    await expect(other.locator('#root > *').first()).toBeVisible()
+    await expect(summary(other)).toContainText('1 version does not parse')
+    await timelineNode(other, 2).click()
+    await expect(other.locator('.editor-status.err')).toContainText('Does not parse')
+  })
+})
