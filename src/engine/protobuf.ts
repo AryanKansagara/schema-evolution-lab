@@ -45,7 +45,14 @@ export interface ProtoFile {
   pkgSpan?: [number, number]
   messages: PMessage[]
   enums: PEnum[]
+  warnings: string[]
 }
+
+const IDENT_RE = /^[A-Za-z_]\w*$/
+const DOTTED_IDENT_RE = /^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$/
+const TYPE_REF_RE = /^\.?[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$/
+const MAP_KEY_TYPES = new Set(['int32', 'int64', 'uint32', 'uint64', 'sint32', 'sint64', 'fixed32', 'fixed64', 'sfixed32', 'sfixed64', 'bool', 'string'])
+const MAX_FIELD_TAG = 536870911
 
 interface Tok {
   v: string
@@ -105,9 +112,11 @@ export function parseProto(text: string): ProtoFile {
       if (t === '}' || t === ']' || t === ')') {
         depth--
         if (depth === 0 && t === '}') return
+        if (depth < 0) fail(`Unexpected "${t}"`)
       }
       if (t === ';' && depth === 0) return
     }
+    fail('Unterminated statement')
   }
   const skipOpts = () => {
     if (peek() !== '[') return
@@ -120,45 +129,73 @@ export function parseProto(text: string): ProtoFile {
   }
   const num = (s: string) => {
     if (!/^(0x[0-9a-fA-F]+|-?\d+)$/.test(s)) fail(`Expected a number, got "${s}"`)
-    return Number(s)
+    const n = Number(s)
+    if (!Number.isSafeInteger(n) || n < -2147483648 || n > 2147483647) fail(`Integer out of 32-bit range: "${s}"`)
+    return n
   }
+
+  const enumAllowAlias = new WeakMap<PEnum, boolean>()
+  const msgReservedNames = new WeakMap<PMessage, Set<string>>()
+  const msgReservedRanges = new WeakMap<PMessage, [number, number][]>()
 
   function parseEnum(prefix: string): PEnum {
     const start = expect('enum').start
     const name = next().v
+    if (!IDENT_RE.test(name)) fail(`Invalid enum name "${name}"`)
     expect('{')
     const values: PEnum['values'] = []
+    let allowAlias = false
     while (peek() !== '}') {
       if (p >= toks.length) fail(`Unterminated enum ${name}`)
-      if (peek() === 'option' || peek() === 'reserved') { skipStatement(); continue }
+      if (peek() === 'option') {
+        const optStart = p
+        skipStatement()
+        if (toks[optStart + 1]?.v === 'allow_alias' && toks[optStart + 2]?.v === '=' && toks[optStart + 3]?.v === 'true') {
+          allowAlias = true
+        }
+        continue
+      }
+      if (peek() === 'reserved') { skipStatement(); continue }
       if (peek() === ';') { p++; continue }
       const n = next().v
+      if (!IDENT_RE.test(n)) fail(`Invalid enum constant name "${n}"`)
       expect('=')
       values.push({ name: n, number: num(next().v) })
       skipOpts()
       expect(';')
     }
     const end = next().end
-    return { name, fullName: prefix + name, values, start, end }
+    const en: PEnum = { name, fullName: prefix + name, values, start, end }
+    enumAllowAlias.set(en, allowAlias)
+    return en
   }
 
   function parseField(owner: PMessage, oneof?: string): void {
     const start = toks[p].start
     let label: PField['label'] = null
     if (peek() === 'optional' || peek() === 'repeated' || peek() === 'required') label = next().v as PField['label']
+    if (label && oneof) fail(`Field label "${label}" is not allowed inside oneof "${oneof}"`)
+    if (label === 'required' && file.syntax === 'proto3') fail("'required' label forbidden in proto3 field declarations")
     let type: string
     let map: PField['map']
     if (peek() === 'map' && toks[p + 1]?.v === '<') {
+      if (label) fail("'map' type cannot have label")
+      if (oneof) fail(`'map' fields are not allowed inside oneof "${oneof}"`)
       p += 2
       const key = next().v
+      if (!IDENT_RE.test(key)) fail(`Invalid map key type "${key}"`)
       expect(',')
       const value = next().v
+      if (!TYPE_REF_RE.test(value)) fail(`Invalid map value type "${value}"`)
       expect('>')
       map = { key, value }
       type = `map<${key}, ${value}>`
-    } else type = next().v
+    } else {
+      type = next().v
+      if (!TYPE_REF_RE.test(type)) fail(`Invalid field type "${type}"`)
+    }
     const name = next().v
-    if (!/^[A-Za-z_]\w*$/.test(name)) fail(`Invalid field name "${name}"`)
+    if (!IDENT_RE.test(name)) fail(`Invalid field name "${name}"`)
     expect('=')
     const number = num(next().v)
     skipOpts()
@@ -170,8 +207,13 @@ export function parseProto(text: string): ProtoFile {
   function parseMessage(prefix: string): PMessage {
     const start = expect('message').start
     const name = next().v
+    if (!IDENT_RE.test(name)) fail(`Invalid message name "${name}"`)
     expect('{')
     const m: PMessage = { name, fullName: prefix + name, fields: [], oneofs: [], messages: [], enums: [], reservedNumbers: new Set(), start, close: 0, end: 0 }
+    const rNames = new Set<string>()
+    const rRanges: [number, number][] = []
+    msgReservedNames.set(m, rNames)
+    msgReservedRanges.set(m, rRanges)
     for (;;) {
       if (p >= toks.length) fail(`Unterminated message ${name}`)
       const t = peek()
@@ -184,20 +226,31 @@ export function parseProto(text: string): ProtoFile {
         p++
         while (peek() !== ';') {
           const v = next().v
-          if (/^\d+$/.test(v)) {
+          if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+            rNames.add(v.slice(1, -1))
+          } else if (/^-?\d+$/.test(v)) {
+            const lo = num(v)
             if (peek() === 'to') {
               p++
               const to = next().v
-              const hi = to === 'max' ? Number(v) : Number(to)
-              for (let n = Number(v); n <= Math.min(hi, Number(v) + 4096); n++) m.reservedNumbers.add(n)
-            } else m.reservedNumbers.add(Number(v))
+              const hi = to === 'max' ? MAX_FIELD_TAG : num(to)
+              rRanges.push([lo, hi])
+              for (let n = lo; n <= Math.min(hi, lo + 4096); n++) m.reservedNumbers.add(n)
+            } else {
+              m.reservedNumbers.add(lo)
+              rRanges.push([lo, lo])
+            }
+          } else if (v !== ',') {
+            fail(`Invalid token "${v}" in reserved statement`)
           }
+          if (peek() === ',') p++
           if (p >= toks.length) fail('Unterminated reserved statement')
         }
         p++
       } else if (t === 'oneof') {
         const os = next().start
         const oname = next().v
+        if (!IDENT_RE.test(oname)) fail(`Invalid oneof name "${oname}"`)
         expect('{')
         while (peek() !== '}') {
           if (p >= toks.length) fail(`Unterminated oneof ${oname}`)
@@ -214,29 +267,156 @@ export function parseProto(text: string): ProtoFile {
     return m
   }
 
-  const file: ProtoFile = { text, syntax: 'proto2', messages: [], enums: [] }
+  const file: ProtoFile = { text, syntax: 'proto2', messages: [], enums: [], warnings: [] }
   let prefix = ''
+  let hasSyntax = false
+  let hasPackage = false
+  let seenDecl = false
+  const topNames = new Set<string>()
   while (p < toks.length) {
     const t = peek()
-    if (t === 'syntax' || t === 'edition') {
+    if (t === 'edition') {
+      fail('Protobuf editions are not supported')
+    } else if (t === 'syntax') {
+      if (hasSyntax) fail('Too many syntax definitions')
+      if (seenDecl) fail("'syntax' element must be the first declaration in a file")
+      hasSyntax = true
       p++
       expect('=')
-      file.syntax = next().v.replace(/["']/g, '')
+      const rawSyn = next().v
+      if (!((rawSyn.startsWith('"') && rawSyn.endsWith('"')) || (rawSyn.startsWith("'") && rawSyn.endsWith("'"))) || rawSyn.length < 2) {
+        fail(`Expected quoted syntax string, got "${rawSyn}"`)
+      }
+      const syn = rawSyn.slice(1, -1)
+      if (syn !== 'proto2' && syn !== 'proto3') fail(`Unsupported syntax "${syn}"`)
+      file.syntax = syn
       expect(';')
     } else if (t === 'package') {
+      seenDecl = true
+      if (hasPackage) fail('Too many package definitions')
+      hasPackage = true
       const s = next().start
       const pkg = next().v
+      if (!DOTTED_IDENT_RE.test(pkg)) fail(`Invalid package name "${pkg}"`)
       const e = expect(';').end
       file.pkg = pkg
       file.pkgSpan = [s, e]
       prefix = pkg + '.'
-    } else if (t === 'import' || t === 'option' || t === 'service' || t === 'extend') skipStatement()
-    else if (t === 'message') file.messages.push(parseMessage(prefix))
-    else if (t === 'enum') file.enums.push(parseEnum(prefix))
-    else if (t === ';') p++
+    } else if (t === 'import') {
+      seenDecl = true
+      p++
+      if (peek() === 'weak' || peek() === 'public') p++
+      const imp = next().v
+      if (!((imp.startsWith('"') && imp.endsWith('"')) || (imp.startsWith("'") && imp.endsWith("'"))) || imp.length < 2) {
+        fail(`Expected quoted import path, got "${imp}"`)
+      }
+      expect(';')
+    } else if (t === 'option' || t === 'service' || t === 'extend') {
+      seenDecl = true
+      skipStatement()
+    } else if (t === 'message') {
+      seenDecl = true
+      const m = parseMessage(prefix)
+      if (topNames.has(m.name)) fail(`${m.fullName} is already defined`)
+      topNames.add(m.name)
+      file.messages.push(m)
+    } else if (t === 'enum') {
+      seenDecl = true
+      const e = parseEnum(prefix)
+      if (topNames.has(e.name)) fail(`${e.fullName} is already defined`)
+      topNames.add(e.name)
+      file.enums.push(e)
+    } else if (t === ';') p++
     else fail('Expected message, enum, service, import, option, package or syntax')
   }
   if (!file.messages.length && !file.enums.length) throw new SchemaParseError('No message or enum found')
+
+  // Post-parse semantic validation modeled on Square Wire + Confluent ProtobufSchema:
+  // - proto2 requires an explicit label on non-map, non-oneof fields (refused by Wire's ProtoParser)
+  // - spec-level checks that ProtobufSchema.validate(false) leaves to protoc (schema.validate.fields=false by default) emit warnings
+  const isReservedTag = (m: PMessage, n: number) =>
+    m.reservedNumbers.has(n) || (msgReservedRanges.get(m) ?? []).some(([lo, hi]) => n >= lo && n <= hi)
+
+  function checkEnum(e: PEnum) {
+    if (!e.values.length) {
+      file.warnings.push(`Enum ${e.name} has no values (Protobuf spec requires at least one constant; accepted unless schema.validate.fields=true)`)
+      return
+    }
+    if (file.syntax === 'proto3' && e.values[0].number !== 0) {
+      file.warnings.push(`Enum ${e.name} first value "${e.values[0].name}" is ${e.values[0].number} (proto3 requires 0; accepted unless schema.validate.fields=true)`)
+    }
+    const seenNames = new Set<string>()
+    const seenNums = new Set<number>()
+    const allowAlias = enumAllowAlias.get(e) ?? false
+    for (const v of e.values) {
+      if (seenNames.has(v.name)) {
+        file.warnings.push(`Enum ${e.name} defines duplicate constant name "${v.name}"`)
+      }
+      seenNames.add(v.name)
+      if (!allowAlias && seenNums.has(v.number)) {
+        file.warnings.push(`Enum ${e.name} reuses constant number ${v.number} without option allow_alias = true`)
+      }
+      seenNums.add(v.number)
+    }
+  }
+
+  function checkEnumsInScope(enums: PEnum[]) {
+    const scopeConsts = new Set<string>()
+    for (const e of enums) {
+      checkEnum(e)
+      for (const v of e.values) {
+        if (scopeConsts.has(v.name)) {
+          file.warnings.push(`Enum ${e.name} constant "${v.name}" conflicts with sibling enum in the same scope`)
+        }
+        scopeConsts.add(v.name)
+      }
+    }
+  }
+
+  function checkMessage(m: PMessage) {
+    const nestedNames = new Set<string>()
+    for (const sub of m.messages) {
+      if (nestedNames.has(sub.name)) file.warnings.push(`Message ${m.name} defines duplicate nested type "${sub.name}"`)
+      nestedNames.add(sub.name)
+      checkMessage(sub)
+    }
+    for (const en of m.enums) {
+      if (nestedNames.has(en.name)) file.warnings.push(`Message ${m.name} defines duplicate nested type "${en.name}"`)
+      nestedNames.add(en.name)
+    }
+    checkEnumsInScope(m.enums)
+    for (const o of m.oneofs) {
+      if (!m.fields.some((f) => f.oneof === o.name)) {
+        file.warnings.push(`Oneof "${o.name}" in ${m.name} has no fields`)
+      }
+    }
+    const fieldNames = new Set<string>()
+    const rNames = msgReservedNames.get(m) ?? new Set<string>()
+    for (const f of m.fields) {
+      if (file.syntax !== 'proto3' && !f.map && !f.oneof && !f.label) {
+        throw new SchemaParseError(`Field "${f.name}" in ${m.name} requires a label (optional, required, or repeated) in ${file.syntax}`)
+      }
+      if (f.number <= 0 || f.number > MAX_FIELD_TAG || (f.number >= 19000 && f.number <= 19999)) {
+        file.warnings.push(`Field ${m.name}.${f.name} uses invalid/reserved tag ${f.number} (Protobuf spec requires 1..${MAX_FIELD_TAG} excluding 19000..19999; accepted unless schema.validate.fields=true)`)
+      }
+      if (fieldNames.has(f.name)) {
+        file.warnings.push(`Message ${m.name} defines duplicate field name "${f.name}"`)
+      }
+      fieldNames.add(f.name)
+      if (isReservedTag(m, f.number)) {
+        file.warnings.push(`Field ${m.name}.${f.name} uses reserved field number ${f.number}`)
+      }
+      if (rNames.has(f.name)) {
+        file.warnings.push(`Field ${m.name}.${f.name} uses reserved field name "${f.name}"`)
+      }
+      if (f.map && !MAP_KEY_TYPES.has(f.map.key)) {
+        file.warnings.push(`Map key type "${f.map.key}" on ${m.name}.${f.name} is invalid in Protobuf`)
+      }
+    }
+  }
+
+  checkEnumsInScope(file.enums)
+  file.messages.forEach(checkMessage)
   return file
 }
 
