@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type KeyboardEvent } from 'react'
-import { Footer, Header } from './App.tsx'
+import { ErrorBoundary, Footer, Header } from './App.tsx'
 import { analyze, applyFix, importFile, type Subject, type Version } from './engine/compat.ts'
 import { SAMPLES, STARTERS } from './engine/samples.ts'
 import { decodeSubject, encodeSubject } from './engine/share.ts'
@@ -41,7 +41,7 @@ function firstFail(s: Subject): Focus | null {
   return null
 }
 
-function Editor({ text, onChange, error, warnings, label, onDropFile }: { text: string; onChange: (t: string) => void; error?: string; warnings: string[]; label: string; onDropFile: (files: File[]) => void }) {
+function Editor({ text, onChange, error, errorStage, warnings, label, onDropFile }: { text: string; onChange: (t: string) => void; error?: string; errorStage?: 'parse' | 'analysis'; warnings: string[]; label: string; onDropFile: (files: File[]) => void }) {
   const gutter = useRef<HTMLDivElement>(null)
   const [over, setOver] = useState(false)
   const lines = text.split('\n').length
@@ -60,7 +60,7 @@ function Editor({ text, onChange, error, warnings, label, onDropFile }: { text: 
       <textarea aria-label={label} spellCheck={false} autoCapitalize="off" autoCorrect="off" wrap="off" value={text} onChange={(e) => onChange(e.target.value)} onScroll={(e) => { if (gutter.current) gutter.current.scrollTop = e.currentTarget.scrollTop }} />
       {(error || warnings.length > 0) && (
         <div className={'editor-status ' + (error ? 'err' : 'warn')} role="status">
-          {error ? `Does not parse: ${error}` : warnings.join(' · ')}
+          {error ? `${errorStage === 'analysis' ? 'Analysis failed' : 'Does not parse'}: ${error}` : warnings.join(' · ')}
         </div>
       )}
     </div>
@@ -230,6 +230,17 @@ export default function Lab() {
   const accepted = subject.versions.filter((_, k) => analysis.verdict(k, subject.mode) !== 'fail' && analysis.verdict(k, subject.mode) !== 'invalid').length
   const failing = subject.versions.map((_, k) => k).filter((k) => analysis.verdict(k, subject.mode) === 'fail')
   const invalid = subject.versions.filter((_, k) => !analysis.parsed[k].ok).length
+  const analysisInvalid = subject.versions.filter((_, k) => {
+    const p = analysis.parsed[k]
+    return !p.ok && p.stage === 'analysis'
+  }).length
+  const parseInvalid = invalid - analysisInvalid
+  const invalidSummary =
+    analysisInvalid === 0
+      ? `${invalid} version${invalid > 1 ? 's do' : ' does'} not parse`
+      : parseInvalid === 0
+        ? `${analysisInvalid} version${analysisInvalid > 1 ? 's' : ''} failed analysis`
+        : `${invalid} versions failed to parse or analyze`
 
   return (
     <>
@@ -302,7 +313,7 @@ export default function Lab() {
         <h1 className="sr-only">Schema Evolution Lab</h1>
         <div className={`summary ${invalid ? 'warn' : failing.length ? 'bad' : 'ok'}`} role="status">
           <strong>
-            {invalid ? `${invalid} version${invalid > 1 ? 's do' : ' does'} not parse` : failing.length ? `${failing.map((k) => `v${k + 1}`).join(', ')} rejected under ${subject.mode}` : `Every version passes ${subject.mode}`}
+            {invalid ? invalidSummary : failing.length ? `${failing.map((k) => `v${k + 1}`).join(', ')} rejected under ${subject.mode}` : `Every version passes ${subject.mode}`}
           </strong>
           <span>
             {accepted} of {n} accepted{subject.mode === 'NONE' && ', but NONE checks nothing'}
@@ -365,7 +376,7 @@ export default function Lab() {
               <h2>v{sel + 1}</h2>
               <span className="muted small">Paste, edit, or drop .avsc, .json or .proto files here</span>
             </div>
-            <Editor key={version.id} label={`Schema text for version ${sel + 1}`} text={version.text} onChange={editText} error={parsed.ok ? undefined : parsed.error} warnings={parsed.ok ? parsed.warnings : []} onDropFile={(f) => void addFiles(f)} />
+            <Editor key={version.id} label={`Schema text for version ${sel + 1}`} text={version.text} onChange={editText} error={parsed.ok ? undefined : parsed.error} errorStage={parsed.ok ? undefined : parsed.stage} warnings={parsed.ok ? parsed.warnings : []} onDropFile={(f) => void addFiles(f)} />
           </section>
 
           <section className="card analysis-card">
@@ -377,21 +388,35 @@ export default function Lab() {
               ))}
             </div>
             <div id="tabpanel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
-              {tab === 'Compatibility' && (
-                <div className="panel-body">
-                  <h3>Version × mode</h3>
-                  <MatrixTable analysis={analysis} count={n} focus={focus} onFocus={(f) => { setFocus(f); if (f.kind === 'mode') setSelected(f.k) }} activeMode={subject.mode} />
-                  <p className="muted small legend">
-                    <span>✓ accepted</span> <span>✕ rejected, with the number of incompatibilities</span> <span>– first version</span> Each row assumes every earlier version is registered.
-                  </p>
-                  <h3>Reader × writer</h3>
-                  <PairGrid analysis={analysis} count={n} focus={focus} onFocus={setFocus} />
-                  <Findings subject={subject} analysis={analysis} focus={focus} onFix={fix} />
-                </div>
-              )}
-              {tab === 'Diff' && <DiffPanel subject={subject} analysis={analysis} selected={sel} />}
-              {tab === 'Simulate' && <SimulatePanel subject={subject} analysis={analysis} selected={sel} />}
-              {tab === 'Upgrade order' && <UpgradePanel subject={subject} analysis={analysis} selected={sel} />}
+              <ErrorBoundary
+                resetKey={`${tab}:${sel}:${subject.format}:${subject.policy}:${subject.mode}:${subject.versions.map((v) => v.text).join('\0')}`}
+                fallback={(err, reset) => (
+                  <div className="panel-body">
+                    <div className="editor-status err" role="alert">
+                      Analysis failed: {err.message}
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={reset}>
+                      Retry
+                    </button>
+                  </div>
+                )}
+              >
+                {tab === 'Compatibility' && (
+                  <div className="panel-body">
+                    <h3>Version × mode</h3>
+                    <MatrixTable analysis={analysis} count={n} focus={focus} onFocus={(f) => { setFocus(f); if (f.kind === 'mode') setSelected(f.k) }} activeMode={subject.mode} />
+                    <p className="muted small legend">
+                      <span>✓ accepted</span> <span>✕ rejected, with the number of incompatibilities</span> <span>– first version</span> Each row assumes every earlier version is registered.
+                    </p>
+                    <h3>Reader × writer</h3>
+                    <PairGrid analysis={analysis} count={n} focus={focus} onFocus={setFocus} />
+                    <Findings subject={subject} analysis={analysis} focus={focus} onFix={fix} />
+                  </div>
+                )}
+                {tab === 'Diff' && <DiffPanel subject={subject} analysis={analysis} selected={sel} />}
+                {tab === 'Simulate' && <SimulatePanel subject={subject} analysis={analysis} selected={sel} />}
+                {tab === 'Upgrade order' && <UpgradePanel subject={subject} analysis={analysis} selected={sel} />}
+              </ErrorBoundary>
             </div>
           </section>
         </div>

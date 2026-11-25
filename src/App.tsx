@@ -1,7 +1,40 @@
-import { useEffect, useState, type MouseEvent, type ReactNode } from 'react'
+import { Component, useEffect, useState, type MouseEvent, type ReactNode } from 'react'
 import Landing from './Landing.tsx'
 import Lab from './Lab.tsx'
 import Docs from './Docs.tsx'
+
+export class ErrorBoundary extends Component<{ resetKey?: unknown; fallback?: (error: Error, reset: () => void) => ReactNode; children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null }
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+  componentDidUpdate(prev: { resetKey?: unknown }) {
+    if (this.state.error && prev.resetKey !== this.props.resetKey) this.setState({ error: null })
+  }
+  render() {
+    if (this.state.error) {
+      const reset = () => this.setState({ error: null })
+      if (this.props.fallback) return this.props.fallback(this.state.error, reset)
+      return (
+        <>
+          <Header />
+          <main className="wrap section">
+            <div className="editor-status err" role="alert">
+              Analysis failed: {this.state.error.message}
+            </div>
+            <p>
+              <button className="btn btn-primary btn-sm" onClick={reset}>
+                Retry
+              </button>
+            </p>
+          </main>
+          <Footer />
+        </>
+      )
+    }
+    return this.props.children
+  }
+}
 
 export function go(href: string) {
   history.pushState({}, '', href)
@@ -91,5 +124,9 @@ export default function App() {
     addEventListener('popstate', onPop)
     return () => removeEventListener('popstate', onPop)
   }, [])
-  return path.startsWith('/app') ? <Lab /> : path.startsWith('/docs') ? <Docs /> : <Landing />
+  return (
+    <ErrorBoundary resetKey={path}>
+      {path.startsWith('/app') ? <Lab /> : path.startsWith('/docs') ? <Docs /> : <Landing />}
+    </ErrorBoundary>
+  )
 }
