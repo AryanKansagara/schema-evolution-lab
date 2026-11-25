@@ -167,8 +167,9 @@ test('proto: renames, additions and removals are compatible; labels follow the r
 })
 
 test('proto: required, oneof moves, package and message removal', () => {
-  assert.deepEqual(pbad('required string a = 1;', ''), ['REQUIRED_FIELD_ADDED'])
-  assert.deepEqual(pbad('', 'required string a = 1;'), ['REQUIRED_FIELD_REMOVED'])
+  const p2 = (body: string) => parseProto(`syntax = "proto2";\npackage a.b;\nmessage M {\n${body}\n}\n`)
+  assert.deepEqual(types(checkProto(p2('required string a = 1;'), p2(''), 'reader')), ['REQUIRED_FIELD_ADDED'])
+  assert.deepEqual(types(checkProto(p2(''), p2('required string a = 1;'), 'reader')), ['REQUIRED_FIELD_REMOVED'])
   assert.deepEqual(pbad('oneof o { string a = 1; string b = 2; }', 'string a = 1; string b = 2;'), ['MULTIPLE_FIELDS_MOVED_TO_ONEOF'])
   assert.deepEqual(pbad('oneof o { string a = 1; string b = 2; }', 'string a = 1; oneof o { string b = 2; }'), ['FIELD_MOVED_TO_EXISTING_ONEOF'])
   assert.deepEqual(pbad('oneof o { string a = 1; }', 'oneof o { string a = 1; string b = 2; }'), ['ONEOF_FIELD_REMOVED'])

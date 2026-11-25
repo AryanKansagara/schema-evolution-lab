@@ -1,7 +1,7 @@
 // Ties the three formats together: parse, pairwise checks, mode verdicts, explanations, upgrade order.
 import { MODES, type Format, type Issue, type Mode, type Fix, type Side } from './types.ts'
 import { checkAvro, diffAvro, parseAvro, SchemaParseError, type AvroSchema, type Change } from './avro.ts'
-import { checkJsonSchema, parseJsonSchema, type JsonPolicy } from './jsonschema.ts'
+import { checkJsonSchema, parseJsonSchemaWithWarnings, type JsonPolicy } from './jsonschema.ts'
 import { checkProto, parseProto, type ProtoFile } from './protobuf.ts'
 import { applyPatch } from './patch.ts'
 
@@ -29,8 +29,12 @@ export function parseVersion(format: Format, text: string): Parsed {
       const schema = parseAvro(text)
       return { ok: true, schema, warnings: schema.warnings }
     }
-    if (format === 'JSON') return { ok: true, schema: parseJsonSchema(text), warnings: [] }
-    return { ok: true, schema: parseProto(text), warnings: [] }
+    if (format === 'JSON') {
+      const { doc, warnings } = parseJsonSchemaWithWarnings(text)
+      return { ok: true, schema: doc, warnings }
+    }
+    const proto = parseProto(text)
+    return { ok: true, schema: proto, warnings: proto.warnings }
   } catch (e) {
     if (e instanceof SchemaParseError) return { ok: false, error: e.message }
     return { ok: false, error: (e as Error).message }

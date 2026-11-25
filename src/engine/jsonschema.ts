@@ -820,3 +820,245 @@ function enumFix(ctx: Ctx, o: Node, u: Node, removed: string[], added: string[])
   if (!Array.isArray(o.s.enum)) return revert(ctx, o, u)
   return { label: `Remove ${added.length ? 'values the old consumers reject' : 'new values'}: ${removed.join(', ')}`, ops: [{ op: 'set', ptr: `${o.ptr}/enum`, value: o.s.enum.filter((x: unknown) => !removed.includes(JSON.stringify(x))) }] }
 }
+
+// ---------- Confluent-faithful keyword type validation & spec-violation warnings ----------
+
+const JSON_TYPES = new Set(['string', 'integer', 'number', 'boolean', 'null', 'array', 'object'])
+const KNOWN_SCHEMA_URIS = /^https?:\/\/json-schema\.org\/(draft-0[467]\/schema|draft\/(2019-09|2020-12)\/schema)#?$/
+const INT_KEYWORDS = ['minLength', 'maxLength', 'minProperties', 'maxProperties', 'minItems', 'maxItems', 'minContains', 'maxContains'] as const
+const NUM_KEYWORDS = ['minimum', 'maximum', 'multipleOf'] as const
+const BOOL_KEYWORDS = ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated'] as const
+const STR_KEYWORDS = ['$id', 'id', '$schema', 'title', 'description', 'format', 'contentEncoding', 'contentMediaType', '$comment'] as const
+const SUB_KEYWORDS = ['additionalProperties', 'unevaluatedProperties', 'additionalItems', 'unevaluatedItems', 'not', 'contains', 'propertyNames', 'if', 'then', 'else'] as const
+const SUB_ARRAY_KEYWORDS = ['allOf', 'anyOf', 'oneOf', 'prefixItems'] as const
+
+const isObjRecord = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
+const isSchemaValue = (v: unknown): v is boolean | Record<string, any> => typeof v === 'boolean' || isObjRecord(v)
+
+function stableKey(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableKey).join(',')}]`
+  if (isObjRecord(v)) {
+    const keys = Object.keys(v).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableKey(v[k])}`).join(',')}}`
+  }
+  return JSON.stringify(v)
+}
+
+/**
+ * Parses and validates a JSON Schema according to Confluent Schema Registry's json-schema-provider
+ * (Everit draft-04/06/07 and json-sKema draft 2019-09/2020-12):
+ *  - Refuses wrong-typed schema keywords, unknown `type` values, invalid regexes, and bad `$ref`s.
+ *  - Emits warnings for JSON Schema spec violations that Everit / json-sKema accept at load time
+ *    (negative integer counts, `multipleOf <= 0`, empty `enum` / combinators, duplicate list entries, inverted bounds).
+ */
+export function parseJsonSchemaWithWarnings(text: string): { doc: unknown; warnings: string[] } {
+  const doc = parseJsonSchema(text)
+  const warnings: string[] = []
+  const draft4 = isObjRecord(doc) && typeof doc.$schema === 'string' && /draft-04\/schema#?$/.test(doc.$schema)
+
+  if (isObjRecord(doc) && typeof doc.$schema === 'string' && !KNOWN_SCHEMA_URIS.test(doc.$schema)) {
+    warnings.push(`Unrecognized $schema "${doc.$schema}" (checked with draft-07 keyword rules)`)
+  }
+
+  function walk(node: unknown, at: string) {
+    if (!isSchemaValue(node)) throw new SchemaParseError(`Expected schema object or boolean at ${at || '#'}`)
+    if (typeof node === 'boolean') return
+
+    if (node.$ref !== undefined) {
+      if (typeof node.$ref !== 'string') throw new SchemaParseError(`"$ref" must be a string at ${at || '#'}`)
+      if (!node.$ref.startsWith('#')) {
+        throw new SchemaParseError(`External $ref "${node.$ref}" at ${at || '#'} is not supported: inline it or use a local #/... reference`)
+      }
+      const seen = new Set<string>()
+      let cur: unknown = node
+      let ptr = node.$ref
+      for (let i = 0; i < 64 && isObjRecord(cur) && typeof cur.$ref === 'string'; i++) {
+        if (!cur.$ref.startsWith('#')) {
+          throw new SchemaParseError(`External $ref "${cur.$ref}" at ${at || '#'} is not supported: inline it or use a local #/... reference`)
+        }
+        if (seen.has(cur.$ref)) throw new SchemaParseError(`Cyclic $ref "${ptr}" at ${at || '#'}`)
+        seen.add(cur.$ref)
+        const target = getAt(doc, cur.$ref.slice(1))
+        if (target === undefined) throw new SchemaParseError(`Unresolved $ref "${cur.$ref}" at ${at || '#'}`)
+        if (!isSchemaValue(target)) throw new SchemaParseError(`$ref target "${cur.$ref}" must be an object or boolean schema`)
+        ptr = cur.$ref
+        cur = target
+      }
+    }
+    for (const kw of STR_KEYWORDS) {
+      if (node[kw] !== undefined && typeof node[kw] !== 'string') {
+        throw new SchemaParseError(`"${kw}" must be a string at ${at || '#'}`)
+      }
+    }
+    for (const kw of BOOL_KEYWORDS) {
+      if (node[kw] !== undefined && typeof node[kw] !== 'boolean') {
+        throw new SchemaParseError(`"${kw}" must be a boolean at ${at || '#'}`)
+      }
+    }
+
+    if (node.type !== undefined) {
+      if (typeof node.type === 'string') {
+        if (!JSON_TYPES.has(node.type)) throw new SchemaParseError(`Invalid JSON Schema type "${node.type}" at ${at || '#'}`)
+      } else if (Array.isArray(node.type)) {
+        for (const entry of node.type) {
+          if (typeof entry !== 'string' || !JSON_TYPES.has(entry)) {
+            throw new SchemaParseError(`Invalid JSON Schema type ${JSON.stringify(entry)} at ${at || '#'}`)
+          }
+        }
+        if (node.type.length === 0) {
+          warnings.push(`Empty "type" array at ${at || '#'} (JSON Schema spec requires at least one type; accepted by Schema Registry)`)
+        } else if (new Set(node.type).size !== node.type.length) {
+          warnings.push(`Duplicate entries in "type" array at ${at || '#'} (JSON Schema spec requires unique items; accepted by Schema Registry)`)
+        }
+      } else {
+        throw new SchemaParseError(`"type" must be a string or an array of strings at ${at || '#'}`)
+      }
+    }
+
+    if (node.required !== undefined) {
+      if (!Array.isArray(node.required) || node.required.some((r) => typeof r !== 'string')) {
+        throw new SchemaParseError(`"required" must be an array of strings at ${at || '#'}`)
+      }
+      if (new Set(node.required).size !== node.required.length) {
+        warnings.push(`Duplicate entries in "required" at ${at || '#'} (JSON Schema spec requires unique items; accepted by Schema Registry)`)
+      }
+    }
+
+    if (node.enum !== undefined) {
+      if (!Array.isArray(node.enum)) throw new SchemaParseError(`"enum" must be an array at ${at || '#'}`)
+      if (node.enum.length === 0) {
+        warnings.push(`Empty "enum" array at ${at || '#'} (JSON Schema spec requires at least one item; accepted by Schema Registry)`)
+      } else if (new Set(node.enum.map(stableKey)).size !== node.enum.length) {
+        warnings.push(`Duplicate values in "enum" at ${at || '#'} (JSON Schema spec requires unique items; accepted by Schema Registry)`)
+      }
+    }
+
+    for (const kw of INT_KEYWORDS) {
+      if (node[kw] !== undefined) {
+        if (typeof node[kw] !== 'number' || !Number.isInteger(node[kw])) {
+          throw new SchemaParseError(`"${kw}" must be an integer at ${at || '#'}`)
+        }
+        if (node[kw] < 0) {
+          warnings.push(`"${kw}" is negative (${node[kw]}) at ${at || '#'} (JSON Schema spec requires >= 0; accepted by Schema Registry)`)
+        }
+      }
+    }
+    for (const [lo, hi] of [['minLength', 'maxLength'], ['minProperties', 'maxProperties'], ['minItems', 'maxItems'], ['minContains', 'maxContains']] as const) {
+      if (typeof node[lo] === 'number' && typeof node[hi] === 'number' && node[lo] > node[hi]) {
+        warnings.push(`"${lo}" (${node[lo]}) exceeds "${hi}" (${node[hi]}) at ${at || '#'}`)
+      }
+    }
+
+    for (const kw of NUM_KEYWORDS) {
+      if (node[kw] !== undefined && (typeof node[kw] !== 'number' || !Number.isFinite(node[kw]))) {
+        throw new SchemaParseError(`"${kw}" must be a number at ${at || '#'}`)
+      }
+    }
+    if (typeof node.multipleOf === 'number' && node.multipleOf <= 0) {
+      warnings.push(`"multipleOf" is ${node.multipleOf} at ${at || '#'} (JSON Schema spec requires > 0; accepted by Schema Registry)`)
+    }
+    if (typeof node.minimum === 'number' && typeof node.maximum === 'number' && node.minimum > node.maximum) {
+      warnings.push(`"minimum" (${node.minimum}) exceeds "maximum" (${node.maximum}) at ${at || '#'}`)
+    }
+
+    for (const kw of ['exclusiveMinimum', 'exclusiveMaximum'] as const) {
+      if (node[kw] !== undefined) {
+        if (draft4) {
+          if (typeof node[kw] !== 'boolean') throw new SchemaParseError(`"${kw}" must be a boolean in draft-04 at ${at || '#'}`)
+        } else if (typeof node[kw] !== 'number' || !Number.isFinite(node[kw])) {
+          throw new SchemaParseError(`"${kw}" must be a number in draft-06+ at ${at || '#'}`)
+        }
+      }
+    }
+
+    if (node.pattern !== undefined) {
+      if (typeof node.pattern !== 'string') throw new SchemaParseError(`"pattern" must be a string at ${at || '#'}`)
+      try {
+        new RegExp(node.pattern)
+      } catch {
+        throw new SchemaParseError(`Invalid regex in "pattern" at ${at || '#'}`)
+      }
+    }
+
+    if (node.properties !== undefined) {
+      if (!isObjRecord(node.properties)) throw new SchemaParseError(`"properties" must be an object at ${at || '#'}`)
+      for (const [k, v] of Object.entries(node.properties)) walk(v, `${at}/properties/${k}`)
+    }
+
+    if (node.patternProperties !== undefined) {
+      if (!isObjRecord(node.patternProperties)) throw new SchemaParseError(`"patternProperties" must be an object at ${at || '#'}`)
+      for (const [k, v] of Object.entries(node.patternProperties)) {
+        try {
+          new RegExp(k)
+        } catch {
+          throw new SchemaParseError(`Invalid patternProperties regex "${k}" at ${at}/patternProperties/${k}`)
+        }
+        walk(v, `${at}/patternProperties/${k}`)
+      }
+    }
+
+    for (const kw of SUB_KEYWORDS) {
+      if (node[kw] !== undefined) walk(node[kw], `${at}/${kw}`)
+    }
+
+    if (node.prefixItems !== undefined && Array.isArray(node.items)) {
+      throw new SchemaParseError(`"items" cannot be an array alongside "prefixItems" at ${at || '#'}`)
+    }
+
+    if (node.items !== undefined) {
+      if (Array.isArray(node.items)) {
+        if (node.items.length === 0) warnings.push(`Empty "items" tuple array at ${at || '#'} (accepted by Schema Registry)`)
+        node.items.forEach((item, i) => walk(item, `${at}/items/${i}`))
+      } else {
+        walk(node.items, `${at}/items`)
+      }
+    }
+
+    for (const kw of SUB_ARRAY_KEYWORDS) {
+      if (node[kw] !== undefined) {
+        if (!Array.isArray(node[kw])) throw new SchemaParseError(`"${kw}" must be an array of schemas at ${at || '#'}`)
+        if (node[kw].length === 0) {
+          warnings.push(`Empty "${kw}" array at ${at || '#'} (JSON Schema spec requires at least one schema; accepted by Schema Registry)`)
+        }
+        node[kw].forEach((sub, i) => walk(sub, `${at}/${kw}/${i}`))
+      }
+    }
+
+    if (node.dependencies !== undefined) {
+      if (!isObjRecord(node.dependencies)) throw new SchemaParseError(`"dependencies" must be an object at ${at || '#'}`)
+      for (const [k, v] of Object.entries(node.dependencies)) {
+        if (Array.isArray(v)) {
+          if (v.some((x) => typeof x !== 'string')) throw new SchemaParseError(`Dependency "${k}" array entries must be strings at ${at}/dependencies/${k}`)
+          if (new Set(v).size !== v.length) warnings.push(`Duplicate entries in dependency "${k}" at ${at}/dependencies/${k}`)
+        } else {
+          walk(v, `${at}/dependencies/${k}`)
+        }
+      }
+    }
+
+    if (node.dependentRequired !== undefined) {
+      if (!isObjRecord(node.dependentRequired)) throw new SchemaParseError(`"dependentRequired" must be an object at ${at || '#'}`)
+      for (const [k, v] of Object.entries(node.dependentRequired)) {
+        if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+          throw new SchemaParseError(`dependentRequired "${k}" must be an array of strings at ${at}/dependentRequired/${k}`)
+        }
+        if (new Set(v).size !== v.length) warnings.push(`Duplicate entries in dependentRequired "${k}" at ${at}/dependentRequired/${k}`)
+      }
+    }
+
+    if (node.dependentSchemas !== undefined) {
+      if (!isObjRecord(node.dependentSchemas)) throw new SchemaParseError(`"dependentSchemas" must be an object at ${at || '#'}`)
+      for (const [k, v] of Object.entries(node.dependentSchemas)) walk(v, `${at}/dependentSchemas/${k}`)
+    }
+
+    for (const kw of ['definitions', '$defs'] as const) {
+      if (node[kw] !== undefined) {
+        if (!isObjRecord(node[kw])) throw new SchemaParseError(`"${kw}" must be an object at ${at || '#'}`)
+        for (const [k, v] of Object.entries(node[kw])) walk(v, `${at}/${kw}/${k}`)
+      }
+    }
+  }
+
+  walk(doc, '')
+  return { doc, warnings }
+}

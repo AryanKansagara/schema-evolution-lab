@@ -34,6 +34,150 @@ export interface AvroSchema {
 export class SchemaParseError extends Error {}
 
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
+const ORDERS = new Set(['ascending', 'descending', 'ignore'])
+
+function checkFullName(raw: string, context: string) {
+  if (!raw) throw new SchemaParseError(`Empty name in ${context}`)
+  const parts = raw.split('.')
+  for (const part of parts) {
+    if (!NAME_RE.test(part)) throw new SchemaParseError(`Illegal name: "${raw}"`)
+  }
+}
+
+function checkNamespace(ns: unknown, context: string): string | undefined {
+  if (ns === undefined || ns === null) return undefined
+  if (typeof ns !== 'string') throw new SchemaParseError(`Namespace must be a string in ${context}`)
+  if (ns === '') return ''
+  for (const part of ns.split('.')) {
+    if (!NAME_RE.test(part)) throw new SchemaParseError(`Illegal namespace: "${ns}"`)
+  }
+  return ns
+}
+
+function validLogicalType(primOrFixed: string, node: Record<string, any>): boolean {
+  const lt = node.logicalType
+  if (typeof lt !== 'string') return false
+  switch (lt) {
+    case 'uuid': return primOrFixed === 'string'
+    case 'date':
+    case 'time-millis': return primOrFixed === 'int'
+    case 'time-micros':
+    case 'timestamp-millis':
+    case 'timestamp-micros':
+    case 'local-timestamp-millis':
+    case 'local-timestamp-micros': return primOrFixed === 'long'
+    case 'duration': return primOrFixed === 'fixed' && node.size === 12
+    case 'decimal': {
+      if (primOrFixed !== 'bytes' && primOrFixed !== 'fixed') return false
+      const precision = node.precision
+      const scale = node.scale ?? 0
+      return Number.isInteger(precision) && precision > 0 && Number.isInteger(scale) && scale >= 0 && scale <= precision
+    }
+    default: return false
+  }
+}
+
+/**
+ * Linear worklist matching Confluent AvroSchema.validate(false) / buildableRecords:
+ * refuses schemas that have no finite datum (infinite record cycles, empty enums, empty unions).
+ */
+function checkBuildable(root: AvroType) {
+  const records = new Map<string, Extract<AvroType, { kind: 'record' }>>()
+  const collect = [root]
+  while (collect.length) {
+    const s = collect.pop()!
+    if (s.kind === 'record' && !records.has(s.fullName)) {
+      records.set(s.fullName, s)
+      for (const f of s.fields) collect.push(f.type)
+    } else if (s.kind === 'union') {
+      for (const b of s.branches) collect.push(b)
+    }
+  }
+
+  const isStaticBuildable = (s: AvroType, buildable: Set<string>): boolean => {
+    if (s.kind === 'record') return buildable.has(s.fullName)
+    if (s.kind === 'union') return s.branches.some((b) => isStaticBuildable(b, buildable))
+    if (s.kind === 'enum') return s.symbols.length > 0
+    return true
+  }
+
+  const unbuilt = new Map<string, number>()
+  const waiting = new Map<string, { record: string; met: boolean }[]>()
+  const ready: string[] = []
+  for (const record of records.values()) {
+    let count = 0
+    for (const f of record.fields) {
+      const branches = f.type.kind === 'union' ? f.type.branches : [f.type]
+      const alts: string[] = []
+      let satisfied = false
+      for (const b of branches) {
+        if (b.kind === 'record') alts.push(b.fullName)
+        else if (isStaticBuildable(b, new Set())) {
+          satisfied = true
+          break
+        }
+      }
+      if (!satisfied) {
+        count++
+        const pending = { record: record.fullName, met: false }
+        for (const name of alts) {
+          const list = waiting.get(name) ?? []
+          list.push(pending)
+          waiting.set(name, list)
+        }
+      }
+    }
+    unbuilt.set(record.fullName, count)
+    if (count === 0) ready.push(record.fullName)
+  }
+
+  const buildable = new Set<string>()
+  while (ready.length) {
+    const name = ready.pop()!
+    buildable.add(name)
+    for (const p of waiting.get(name) ?? []) {
+      if (!p.met) {
+        p.met = true
+        const rem = (unbuilt.get(p.record) ?? 0) - 1
+        unbuilt.set(p.record, rem)
+        if (rem === 0) ready.push(p.record)
+      }
+    }
+  }
+
+  if (!isStaticBuildable(root, buildable)) {
+    const names: string[] = []
+    const fields: string[] = []
+    const seen = new Set<string>()
+    let reason: string | null = null
+    let cur: AvroType = root
+    for (;;) {
+      if (cur.kind === 'union') {
+        if (!cur.branches.length) {
+          reason = 'an empty union'
+          break
+        }
+        cur = cur.branches[0]
+        continue
+      }
+      if (cur.kind === 'enum') {
+        names.push(cur.fullName)
+        reason = 'an enum with no symbols'
+        break
+      }
+      if (cur.kind !== 'record') break
+      names.push(cur.fullName)
+      if (seen.has(cur.fullName)) break
+      seen.add(cur.fullName)
+      const nextField = cur.fields.find((f) => !isStaticBuildable(f.type, buildable))
+      if (!nextField) break
+      fields.push(`'${nextField.name}'`)
+      cur = nextField.type
+    }
+    const base = names.length ? names.join(' -> ') + (fields.length ? ` through fields ${fields.join(', ')}` : '') : reason
+    throw new SchemaParseError(`Schema has no finite value: ${reason && names.length ? `${base} (${reason})` : base}`)
+  }
+}
 
 export function parseAvro(text: string): AvroSchema {
   let doc: unknown
@@ -68,30 +212,57 @@ export function parseAvro(text: string): AvroSchema {
     }
     if (!node || typeof node !== 'object') throw new SchemaParseError(`Not a valid schema at ${ptr || '/'}: ${JSON.stringify(node)}`)
     const t = node.type
-    if (typeof t === 'string' && (PRIMS as readonly string[]).includes(t))
-      return { kind: 'primitive', name: t as Prim, logical: node.logicalType, ptr }
-    if (t === 'array') return { kind: 'array', items: parse(node.items, `${ptr}/items`, ns), ptr }
-    if (t === 'map') return { kind: 'map', values: parse(node.values, `${ptr}/values`, ns), ptr }
+    if (typeof t === 'string' && (PRIMS as readonly string[]).includes(t)) {
+      if (node.logicalType !== undefined && !validLogicalType(t, node)) {
+        warnings.push(`Ignored invalid logicalType ${JSON.stringify(node.logicalType)} on ${t} at ${ptr || '/'}`)
+      }
+      return { kind: 'primitive', name: t as Prim, logical: typeof node.logicalType === 'string' ? node.logicalType : undefined, ptr }
+    }
+    if (t === 'array') {
+      if (!('items' in node)) throw new SchemaParseError(`Array schema missing "items" at ${ptr || '/'}`)
+      return { kind: 'array', items: parse(node.items, `${ptr}/items`, ns), ptr }
+    }
+    if (t === 'map') {
+      if (!('values' in node)) throw new SchemaParseError(`Map schema missing "values" at ${ptr || '/'}`)
+      return { kind: 'map', values: parse(node.values, `${ptr}/values`, ns), ptr }
+    }
     if (t === 'record' || t === 'error' || t === 'enum' || t === 'fixed') {
-      if (typeof node.name !== 'string') throw new SchemaParseError(`No name in ${t} at ${ptr || '/'}`)
-      const nsHere = node.name.includes('.') ? node.name.slice(0, node.name.lastIndexOf('.')) : (node.namespace ?? ns)
+      if (typeof node.name !== 'string' || !node.name) throw new SchemaParseError(`No name in ${t} at ${ptr || '/'}`)
+      const explicitNs = checkNamespace(node.namespace, `${t} ${node.name}`)
+      const hasDot = node.name.includes('.')
+      if (hasDot) checkFullName(node.name, `${t} at ${ptr || '/'}`)
+      else if (!NAME_RE.test(node.name)) throw new SchemaParseError(`Illegal name: "${node.name}"`)
+      const nsHere = hasDot ? node.name.slice(0, node.name.lastIndexOf('.')) : (explicitNs !== undefined ? (explicitNs || undefined) : ns)
       const fullName = fullNameOf(node.name, nsHere)
       const name = fullName.split('.').pop()!
-      if (!NAME_RE.test(name)) throw new SchemaParseError(`Illegal name: "${name}"`)
+      if (!nsHere && (PRIMS as readonly string[]).includes(name)) throw new SchemaParseError(`Illegal primitive name: "${name}"`)
       if (named.has(fullName)) throw new SchemaParseError(`Can't redefine: ${fullName}`)
-      const aliases: string[] = (node.aliases ?? []).map((a: string) => fullNameOf(a, nsHere))
+      if (node.aliases !== undefined && (!Array.isArray(node.aliases) || node.aliases.some((a: unknown) => typeof a !== 'string'))) {
+        throw new SchemaParseError(`Aliases must be an array of strings (${fullName})`)
+      }
+      const aliases: string[] = (node.aliases ?? []).map((a: string) => {
+        checkFullName(a, `alias of ${fullName}`)
+        return fullNameOf(a, nsHere)
+      })
       if (t === 'enum') {
-        const symbols: string[] = node.symbols ?? []
-        if (!Array.isArray(symbols)) throw new SchemaParseError(`Enum symbols must be an array (${fullName})`)
+        if (!Array.isArray(node.symbols)) throw new SchemaParseError(`Enum ${fullName} has no symbols`)
+        for (const s of node.symbols) {
+          if (typeof s !== 'string' || !NAME_RE.test(s)) throw new SchemaParseError(`Illegal enum symbol "${String(s)}" in ${fullName}`)
+        }
+        const symbols: string[] = node.symbols
         if (new Set(symbols).size !== symbols.length) throw new SchemaParseError(`Duplicate enum symbol in ${fullName}`)
-        if (node.default !== undefined && !symbols.includes(node.default))
-          throw new SchemaParseError(`Enum default "${node.default}" is not a symbol of ${fullName}`)
+        if (node.default !== undefined && (typeof node.default !== 'string' || !symbols.includes(node.default)))
+          throw new SchemaParseError(`Enum default "${String(node.default)}" is not a symbol of ${fullName}`)
+        if (symbols.length === 0) warnings.push(`Enum ${fullName} has no symbols`)
         const e: AvroType = { kind: 'enum', name, fullName, aliases, symbols, default: node.default, ptr, raw: node }
         named.set(fullName, e)
         return e
       }
       if (t === 'fixed') {
-        if (!Number.isInteger(node.size)) throw new SchemaParseError(`Fixed ${fullName} needs an integer size`)
+        if (!Number.isInteger(node.size) || node.size < 0) throw new SchemaParseError(`Fixed ${fullName} needs a non-negative integer size`)
+        if (node.logicalType !== undefined && !validLogicalType('fixed', node)) {
+          warnings.push(`Ignored invalid logicalType ${JSON.stringify(node.logicalType)} on fixed ${fullName}`)
+        }
         const f: AvroType = { kind: 'fixed', name, fullName, aliases, size: node.size, ptr, raw: node }
         named.set(fullName, f)
         return f
@@ -102,14 +273,42 @@ export function parseAvro(text: string): AvroSchema {
       const names = new Set<string>()
       node.fields.forEach((f: any, i: number) => {
         const fptr = `${ptr}/fields/${i}`
-        if (typeof f?.name !== 'string') throw new SchemaParseError(`Field ${i} of ${fullName} has no name`)
+        if (!f || typeof f !== 'object' || Array.isArray(f)) throw new SchemaParseError(`Field ${i} of ${fullName} must be an object`)
+        if (typeof f.name !== 'string') throw new SchemaParseError(`Field ${i} of ${fullName} has no name`)
+        if (!NAME_RE.test(f.name)) throw new SchemaParseError(`Illegal field name "${f.name}" in ${fullName}`)
         if (names.has(f.name)) throw new SchemaParseError(`Duplicate field ${f.name} in ${fullName}`)
         names.add(f.name)
+        if (f.aliases !== undefined) {
+          if (!Array.isArray(f.aliases) || f.aliases.some((a: unknown) => typeof a !== 'string' || !NAME_RE.test(a))) {
+            throw new SchemaParseError(`Field ${fullName}.${f.name} aliases must be valid identifier strings`)
+          }
+        }
+        if (f.order !== undefined && !ORDERS.has(f.order)) {
+          throw new SchemaParseError(`Invalid field order "${String(f.order)}" on ${fullName}.${f.name}`)
+        }
+        if ('logicalType' in f) {
+          warnings.push(`Field ${name}.${f.name}: logicalType on field object is ignored; place it inside "type"`)
+        }
         if (!('type' in f)) throw new SchemaParseError(`Field ${fullName}.${f.name} has no type`)
         const type = parse(f.type, `${fptr}/type`, nsHere)
         const hasDefault = 'default' in f
-        if (hasDefault && !defaultMatches(type, f.default))
-          warnings.push(`Field ${name}.${f.name}: default ${JSON.stringify(f.default)} does not match its type${type.kind === 'union' ? ' (union defaults must match the FIRST branch)' : ''}`)
+        if (hasDefault) {
+          if (type.kind === 'union') {
+            if (!type.branches.length || !defaultMatchesAnyBranch(type, f.default)) {
+              throw new SchemaParseError(`Invalid default for field ${name}.${f.name}: ${JSON.stringify(f.default)} does not match ${typeName(type)}`)
+            }
+            if (!defaultMatches(type.branches[0], f.default)) {
+              warnings.push(`Field ${name}.${f.name}: default ${JSON.stringify(f.default)} does not match its type (union defaults must match the FIRST branch)`)
+            }
+          } else {
+            if (!defaultMatchesConfluent(type, f.default)) {
+              throw new SchemaParseError(`Invalid default for field ${name}.${f.name}: ${JSON.stringify(f.default)} does not match ${typeName(type)}`)
+            }
+            if (type.kind === 'fixed' && typeof f.default === 'string' && f.default.length !== type.size) {
+              warnings.push(`Field ${name}.${f.name}: fixed default length (${f.default.length}) differs from size ${type.size}`)
+            }
+          }
+        }
         ;(rec as any).fields.push({ name: f.name, aliases: f.aliases ?? [], type, hasDefault, default: f.default, ptr: fptr, raw: f })
       })
       return rec
@@ -119,28 +318,46 @@ export function parseAvro(text: string): AvroSchema {
     throw new SchemaParseError(`Unknown type ${JSON.stringify(t)} at ${ptr || '/'}`)
   }
 
-  return { root: parse(doc, '', undefined), named, doc, warnings }
+  const root = parse(doc, '', undefined)
+  checkBuildable(root)
+  return { root, named, doc, warnings }
 }
 
-export function defaultMatches(t: AvroType, v: unknown): boolean {
+function defaultMatchesAnyBranch(t: Extract<AvroType, { kind: 'union' }>, v: unknown, seen = new Set<string>()): boolean {
+  return t.branches.some((b) => defaultMatchesConfluent(b, v, seen))
+}
+
+function defaultMatchesConfluent(t: AvroType, v: unknown, seen = new Set<string>()): boolean {
   switch (t.kind) {
     case 'union':
-      return defaultMatches(t.branches[0], v)
+      return defaultMatchesAnyBranch(t, v, seen)
     case 'primitive':
       switch (t.name) {
         case 'null': return v === null
         case 'boolean': return typeof v === 'boolean'
-        case 'int': case 'long': return Number.isInteger(v)
-        case 'float': case 'double': return typeof v === 'number'
+        case 'int': return typeof v === 'number' && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647
+        case 'long': return typeof v === 'number' && Number.isInteger(v) && Number.isSafeInteger(v)
+        case 'float': case 'double': return typeof v === 'number' && Number.isFinite(v)
         default: return typeof v === 'string'
       }
     case 'enum': return typeof v === 'string' && t.symbols.includes(v)
     case 'fixed': return typeof v === 'string'
-    case 'array': return Array.isArray(v) && v.every((x) => defaultMatches(t.items, x))
-    case 'map': return !!v && typeof v === 'object' && !Array.isArray(v) && Object.values(v).every((x) => defaultMatches(t.values, x))
-    case 'record':
-      return !!v && typeof v === 'object' && !Array.isArray(v) && t.fields.every((f) => (f.name in (v as object) ? defaultMatches(f.type, (v as any)[f.name]) : f.hasDefault))
+    case 'array': return Array.isArray(v) && v.every((x) => defaultMatchesConfluent(t.items, x, seen))
+    case 'map': return !!v && typeof v === 'object' && !Array.isArray(v) && Object.values(v).every((x) => defaultMatchesConfluent(t.values, x, seen))
+    case 'record': {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+      if (seen.has(t.fullName)) return true
+      seen.add(t.fullName)
+      const ok = t.fields.every((f) => (f.name in (v as object) ? defaultMatchesConfluent(f.type, (v as any)[f.name], seen) : f.hasDefault))
+      seen.delete(t.fullName)
+      return ok
+    }
   }
+}
+
+export function defaultMatches(t: AvroType, v: unknown): boolean {
+  if (t.kind === 'union') return t.branches.length > 0 && defaultMatches(t.branches[0], v)
+  return defaultMatchesConfluent(t, v)
 }
 
 export function typeName(t: AvroType): string {
@@ -176,16 +393,29 @@ function rawFor(t: AvroType, target: AvroSchema, seen = new Set<string>()): unkn
 }
 
 /** A sensible default value for a type (used by the "add default" fix). */
-export function zeroValue(t: AvroType): unknown {
+export function zeroValue(t: AvroType, seen = new Set<string>()): unknown {
   switch (t.kind) {
     case 'primitive':
       return t.name === 'null' ? null : t.name === 'boolean' ? false : t.name === 'string' || t.name === 'bytes' ? '' : 0
-    case 'enum': return t.default ?? t.symbols[0]
+    case 'enum': return t.default ?? t.symbols[0] ?? ''
     case 'array': return []
     case 'map': return {}
-    case 'union': return zeroValue(t.branches[0])
-    case 'fixed': return '\u0000'.repeat(t.size)
-    case 'record': return Object.fromEntries(t.fields.map((f) => [f.name, f.hasDefault ? f.default : zeroValue(f.type)]))
+    case 'union': {
+      for (const b of t.branches) {
+        if (b.kind === 'record' && seen.has(b.fullName)) continue
+        if (b.kind === 'enum' && !b.symbols.length && b.default === undefined) continue
+        return zeroValue(b, seen)
+      }
+      return null
+    }
+    case 'fixed': return '\u0000'.repeat(Math.max(0, t.size))
+    case 'record': {
+      if (seen.has(t.fullName)) return {}
+      seen.add(t.fullName)
+      const out = Object.fromEntries(t.fields.map((f) => [f.name, f.hasDefault ? f.default : zeroValue(f.type, seen)]))
+      seen.delete(t.fullName)
+      return out
+    }
   }
 }
 
