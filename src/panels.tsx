@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { breaking, canonicalText, explain, lineDiff, MODE_INFO, registryError, structuralChanges, transitionAdvice, type Analysis, type Subject } from './engine/compat.ts'
+import { breaking, canonicalText, explain, lineDiff, MODE_INFO, registryError, structuralChanges, transitionAdvice, type Analysis, type Change, type Subject } from './engine/compat.ts'
 import { MODES, type Format, type Issue, type Mode, type Fix } from './engine/types.ts'
 import { generate, simulate, type SimNote } from './engine/simulate.ts'
 import type { AvroSchema } from './engine/avro.ts'
@@ -170,12 +170,20 @@ export function Findings({ subject, analysis, focus, onFix }: { subject: Subject
   const notes = checks.flatMap((c) => c.issues.filter((i) => i.compatible).map((issue) => ({ issue, c })))
   const reserves = checks.flatMap((c) => c.issues.filter((i) => i.compatible && i.fix).map((issue) => ({ issue, c })))
   const invalid = focus.kind === 'mode' ? analysis.verdict(focus.k, focus.mode) === 'invalid' : analysis.pair(focus.reader, focus.writer) === null
+  const relevant =
+    focus.kind === 'mode'
+      ? [focus.k, ...analysis.checks(focus.k, focus.mode).flatMap((c) => [c.reader, c.writer])]
+      : [focus.reader, focus.writer]
+  const hasAnalysisErr = relevant.some((i) => {
+    const p = analysis.parsed[i]
+    return p && !p.ok && p.stage === 'analysis'
+  })
   return (
     <section className="findings" aria-label="Findings">
       <h3>
         {title}{' '}
         {invalid ? (
-          <span className="tag warn">does not parse</span>
+          <span className="tag warn">{hasAnalysisErr ? 'analysis failed' : 'does not parse'}</span>
         ) : bad.length ? (
           <span className="tag bad">
             ✕ {bad.length} incompatibilit{bad.length === 1 ? 'y' : 'ies'}
@@ -186,7 +194,7 @@ export function Findings({ subject, analysis, focus, onFix }: { subject: Subject
       </h3>
       {focus.kind === 'mode' && focus.k === 0 && <div className="empty">The first version has nothing to be compatible with.</div>}
       {focus.kind === 'mode' && focus.mode === 'NONE' && focus.k > 0 && <div className="empty">NONE skips the checks, so the registry accepts anything. See the reader × writer grid for what would break.</div>}
-      {invalid && <div className="empty">Fix the parse error in the editor first.</div>}
+      {invalid && <div className="empty">{hasAnalysisErr ? 'Analysis failed for one of these versions; see the editor status.' : 'Fix the parse error in the editor first.'}</div>}
       {bad.map(({ issue, c }, i) => (
         <IssueCard key={i} format={subject.format} issue={issue} reader={c.reader} writer={c.writer} onFix={onFix} />
       ))}
@@ -243,7 +251,15 @@ export function DiffPanel({ subject, analysis, selected }: { subject: Subject; a
   }, [selected])
   const a = Math.min(from, n - 1), b = Math.min(to, n - 1)
   const pa = analysis.parsed[a], pb = analysis.parsed[b]
-  const changes = useMemo(() => (pa?.ok && pb?.ok && a !== b ? structuralChanges(subject.format, pa.schema, pb.schema, subject.policy) : []), [pa, pb, a, b, subject.format, subject.policy])
+  const diffResult = useMemo(() => {
+    if (!pa?.ok || !pb?.ok || a === b) return { changes: [] as Change[], error: '' }
+    try {
+      return { changes: structuralChanges(subject.format, pa.schema, pb.schema, subject.policy), error: '' }
+    } catch (e) {
+      return { changes: [] as Change[], error: (e as Error).message || 'Could not compute structural diff' }
+    }
+  }, [pa, pb, a, b, subject.format, subject.policy])
+  const changes = diffResult.changes
   const lines = useMemo(() => lineDiff(canonicalText(subject.format, subject.versions[a].text), canonicalText(subject.format, subject.versions[b].text)), [a, b, subject])
   return (
     <div className="panel-body">
@@ -256,6 +272,8 @@ export function DiffPanel({ subject, analysis, selected }: { subject: Subject; a
         <div className="empty">Pick two different versions.</div>
       ) : !pa?.ok || !pb?.ok ? (
         <div className="empty">One of these versions does not parse, so only the text diff is available.</div>
+      ) : diffResult.error ? (
+        <div className="editor-status err" role="status">Analysis failed: {diffResult.error}</div>
       ) : changes.length === 0 ? (
         <div className="empty">No structural changes between these versions.</div>
       ) : (
@@ -317,13 +335,17 @@ export function SimulatePanel({ subject, analysis, selected }: { subject: Subjec
   }, [selected])
   const w = Math.min(writer, n - 1), r = Math.min(reader, n - 1)
   const pw = analysis.parsed[w], pr = analysis.parsed[r]
-  const genText = useMemo(() => {
-    if (subject.format !== 'AVRO' || !pw?.ok) return ''
-    const root = (pw.schema as AvroSchema).root
-    return JSON.stringify(generate(root, 'name' in root ? root.name : 'value'), null, 2)
+  const gen = useMemo(() => {
+    if (subject.format !== 'AVRO' || !pw?.ok) return { text: '', error: '' }
+    try {
+      const root = (pw.schema as AvroSchema).root
+      return { text: JSON.stringify(generate(root, 'name' in root ? root.name : 'value'), null, 2), error: '' }
+    } catch (e) {
+      return { text: '', error: (e as Error).message || 'Could not generate sample record' }
+    }
   }, [pw, subject.format])
-  const [recordText, setRecordText] = useState(genText)
-  useEffect(() => setRecordText(genText), [genText])
+  const [recordText, setRecordText] = useState(gen.text)
+  useEffect(() => setRecordText(gen.text), [gen.text])
 
   if (subject.format !== 'AVRO')
     return (
@@ -334,6 +356,7 @@ export function SimulatePanel({ subject, analysis, selected }: { subject: Subjec
       </div>
     )
   if (!pw?.ok || !pr?.ok) return <div className="panel-body"><div className="empty">Both versions must parse before a record can be resolved.</div></div>
+  if (gen.error) return <div className="panel-body"><div className="editor-status err" role="status">Simulation failed: {gen.error}</div></div>
 
   let record: unknown, recordErr = ''
   try {
@@ -358,7 +381,7 @@ export function SimulatePanel({ subject, analysis, selected }: { subject: Subjec
         <VersionSelect label="Writer" value={w} count={n} onChange={setWriter} />
         <span aria-hidden>→</span>
         <VersionSelect label="Reader" value={r} count={n} onChange={setReader} />
-        <button className="btn btn-ghost btn-sm" onClick={() => setRecordText(genText)}>
+        <button className="btn btn-ghost btn-sm" onClick={() => setRecordText(gen.text)}>
           Reset record
         </button>
       </div>

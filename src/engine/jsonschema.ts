@@ -49,13 +49,158 @@ export function parseJsonSchema(text: string): unknown {
   return doc
 }
 
+const isPlainObject = (v: unknown): v is Record<string, any> =>
+  !!v && typeof v === 'object' && !Array.isArray(v)
+
+const isSubschema = (v: unknown): v is boolean | Record<string, any> =>
+  typeof v === 'boolean' || isPlainObject(v)
+
+const SUBSCHEMA_KEYS = [
+  'additionalProperties', 'unevaluatedProperties', 'additionalItems', 'unevaluatedItems',
+  'not', 'contains', 'propertyNames', 'if', 'then', 'else',
+] as const
+
+const SUBSCHEMA_ARRAY_KEYS = ['prefixItems', 'allOf', 'anyOf', 'oneOf'] as const
+const SCHEMA_MAP_KEYS = ['definitions', '$defs'] as const
+
 function checkRefs(root: unknown, node: any, at: string) {
-  if (!node || typeof node !== 'object') return
-  if (typeof node.$ref === 'string') {
-    if (!node.$ref.startsWith('#')) throw new SchemaParseError(`External $ref "${node.$ref}" at ${at || '#'} is not supported: inline it or use a local #/... reference`)
-    if (getAt(root, node.$ref.slice(1)) === undefined) throw new SchemaParseError(`Unresolved $ref "${node.$ref}" at ${at || '#'}`)
+  if (!isSubschema(node))
+    throw new SchemaParseError(`Expected schema object or boolean at ${at || '#'}`)
+  if (typeof node === 'boolean') return
+
+  if ('$ref' in node && node.$ref !== undefined) {
+    if (typeof node.$ref !== 'string')
+      throw new SchemaParseError(`"$ref" must be a string at ${at || '#'}`)
+    if (!node.$ref.startsWith('#'))
+      throw new SchemaParseError(`External $ref "${node.$ref}" at ${at || '#'} is not supported: inline it or use a local #/... reference`)
+    const target = getAt(root, node.$ref.slice(1))
+    if (target === undefined)
+      throw new SchemaParseError(`Unresolved $ref "${node.$ref}" at ${at || '#'}`)
+    if (!isSubschema(target))
+      throw new SchemaParseError(`$ref target "${node.$ref}" at ${at || '#'} must be a schema object or boolean`)
+    let cur: unknown = target
+    const seen = new Set<string>([node.$ref])
+    while (isPlainObject(cur) && typeof cur.$ref === 'string') {
+      if (!cur.$ref.startsWith('#')) break
+      if (seen.has(cur.$ref))
+        throw new SchemaParseError(`Cyclic $ref "${cur.$ref}" at ${at || '#'}`)
+      seen.add(cur.$ref)
+      cur = getAt(root, cur.$ref.slice(1))
+    }
   }
-  for (const k of Object.keys(node)) checkRefs(root, node[k], `${at}/${k}`)
+
+  if (node.enum !== undefined && !Array.isArray(node.enum))
+    throw new SchemaParseError(`"enum" must be an array at ${at || '#'}`)
+  if (node.type !== undefined && typeof node.type !== 'string' && (!Array.isArray(node.type) || node.type.some((t: unknown) => typeof t !== 'string')))
+    throw new SchemaParseError(`"type" must be a string or an array of strings at ${at || '#'}`)
+
+  if (node.required !== undefined && (!Array.isArray(node.required) || node.required.some((r: unknown) => typeof r !== 'string')))
+    throw new SchemaParseError(`"required" must be an array of strings at ${at || '#'}`)
+
+  if (node.properties !== undefined) {
+    if (!isPlainObject(node.properties))
+      throw new SchemaParseError(`"properties" must be an object at ${at || '#'}`)
+    for (const [k, v] of Object.entries(node.properties)) {
+      if (!isSubschema(v))
+        throw new SchemaParseError(`Property "${k}" schema must be an object or boolean at ${at}/properties/${k}`)
+      checkRefs(root, v, `${at}/properties/${k}`)
+    }
+  }
+
+  if (node.patternProperties !== undefined) {
+    if (!isPlainObject(node.patternProperties))
+      throw new SchemaParseError(`"patternProperties" must be an object at ${at || '#'}`)
+    for (const [k, v] of Object.entries(node.patternProperties)) {
+      try {
+        new RegExp(k)
+      } catch {
+        throw new SchemaParseError(`Invalid patternProperties regex "${k}" at ${at}/patternProperties/${k}`)
+      }
+      if (!isSubschema(v))
+        throw new SchemaParseError(`patternProperties "${k}" schema must be an object or boolean at ${at}/patternProperties/${k}`)
+      checkRefs(root, v, `${at}/patternProperties/${k}`)
+    }
+  }
+
+  for (const kw of SUBSCHEMA_KEYS) {
+    if (node[kw] !== undefined) {
+      if (!isSubschema(node[kw]))
+        throw new SchemaParseError(`"${kw}" must be a schema object or boolean at ${at || '#'}`)
+      checkRefs(root, node[kw], `${at}/${kw}`)
+    }
+  }
+
+  if (node.items !== undefined) {
+    if (Array.isArray(node.items)) {
+      node.items.forEach((item: unknown, i: number) => {
+        if (!isSubschema(item))
+          throw new SchemaParseError(`"items[${i}]" must be a schema object or boolean at ${at}/items/${i}`)
+        checkRefs(root, item, `${at}/items/${i}`)
+      })
+    } else if (isSubschema(node.items)) {
+      checkRefs(root, node.items, `${at}/items`)
+    } else {
+      throw new SchemaParseError(`"items" must be a schema object, boolean, or array of schemas at ${at || '#'}`)
+    }
+  }
+
+  for (const kw of SUBSCHEMA_ARRAY_KEYS) {
+    if (node[kw] !== undefined) {
+      if (!Array.isArray(node[kw]))
+        throw new SchemaParseError(`"${kw}" must be an array of schemas at ${at || '#'}`)
+      node[kw].forEach((item: unknown, i: number) => {
+        if (!isSubschema(item))
+          throw new SchemaParseError(`"${kw}[${i}]" must be a schema object or boolean at ${at}/${kw}/${i}`)
+        checkRefs(root, item, `${at}/${kw}/${i}`)
+      })
+    }
+  }
+
+  if (node.dependencies !== undefined) {
+    if (!isPlainObject(node.dependencies))
+      throw new SchemaParseError(`"dependencies" must be an object at ${at || '#'}`)
+    for (const [k, v] of Object.entries(node.dependencies)) {
+      if (Array.isArray(v)) {
+        if (v.some((x) => typeof x !== 'string'))
+          throw new SchemaParseError(`Dependency "${k}" array entries must be strings at ${at}/dependencies/${k}`)
+      } else if (isSubschema(v)) {
+        checkRefs(root, v, `${at}/dependencies/${k}`)
+      } else {
+        throw new SchemaParseError(`Dependency "${k}" must be a schema or an array of strings at ${at}/dependencies/${k}`)
+      }
+    }
+  }
+
+  if (node.dependentRequired !== undefined) {
+    if (!isPlainObject(node.dependentRequired))
+      throw new SchemaParseError(`"dependentRequired" must be an object at ${at || '#'}`)
+    for (const [k, v] of Object.entries(node.dependentRequired)) {
+      if (!Array.isArray(v) || v.some((x) => typeof x !== 'string'))
+        throw new SchemaParseError(`dependentRequired "${k}" must be an array of strings at ${at}/dependentRequired/${k}`)
+    }
+  }
+
+  if (node.dependentSchemas !== undefined) {
+    if (!isPlainObject(node.dependentSchemas))
+      throw new SchemaParseError(`"dependentSchemas" must be an object at ${at || '#'}`)
+    for (const [k, v] of Object.entries(node.dependentSchemas)) {
+      if (!isSubschema(v))
+        throw new SchemaParseError(`dependentSchemas "${k}" must be a schema object or boolean at ${at}/dependentSchemas/${k}`)
+      checkRefs(root, v, `${at}/dependentSchemas/${k}`)
+    }
+  }
+
+  for (const kw of SCHEMA_MAP_KEYS) {
+    if (node[kw] !== undefined) {
+      if (!isPlainObject(node[kw]))
+        throw new SchemaParseError(`"${kw}" must be an object at ${at || '#'}`)
+      for (const [k, v] of Object.entries(node[kw])) {
+        if (!isSubschema(v))
+          throw new SchemaParseError(`${kw} "${k}" must be a schema object or boolean at ${at}/${kw}/${k}`)
+        checkRefs(root, v, `${at}/${kw}/${k}`)
+      }
+    }
+  }
 }
 
 interface Node {
@@ -88,7 +233,10 @@ const at = (n: Node, path: string): Node => ({ ...n, path })
 
 function deref(doc: unknown, n: Node): Node {
   let { s, ptr } = n
-  for (let i = 0; i < 32 && s && typeof s === 'object' && typeof s.$ref === 'string'; i++) {
+  const seen = new Set<string>()
+  for (let i = 0; i < 32 && isPlainObject(s) && typeof s.$ref === 'string'; i++) {
+    if (seen.has(s.$ref)) break
+    seen.add(s.$ref)
     ptr = s.$ref.slice(1)
     s = getAt(doc, ptr)
   }
@@ -99,6 +247,7 @@ function deref(doc: unknown, n: Node): Node {
 function classOf(s: any): string {
   if (s === false) return 'false'
   if (s === true) return 'empty'
+  if (!isPlainObject(s)) return 'empty'
   if (combo(s)) return 'combined'
   if (Array.isArray(s.enum)) return 'enum'
   if ('const' in s) return 'const'
@@ -122,7 +271,7 @@ type Combo = { crit: string; subs: (n: Node) => Node[] }
  *    So {"type":"string","enum":[...]} is allOf[string, enum], and dropping the enum narrows the product.
  */
 function combo(s: any): Combo | undefined {
-  if (!s || typeof s !== 'object') return undefined
+  if (!isPlainObject(s)) return undefined
   if (Array.isArray(s.type) && s.type.length > 1)
     return { crit: 'anyOf', subs: (n) => s.type.map((t: string) => ({ s: { ...s, type: t }, ptr: n.ptr, path: n.path, whole: n })) }
   if (Array.isArray(s.type) && s.type.length === 1) return combo({ ...s, type: s.type[0] })
@@ -136,7 +285,7 @@ function combo(s: any): Combo | undefined {
   return undefined
 }
 
-const single = (s: any) => (s && Array.isArray(s.type) && s.type.length === 1 ? { ...s, type: s.type[0] } : s)
+const single = (s: any) => (isPlainObject(s) && Array.isArray(s.type) && s.type.length === 1 ? { ...s, type: s.type[0] } : s)
 const hasDefault = (s: any) => !!s && typeof s === 'object' && 'default' in s
 const humanOf = (ptr: string) => ptr.replace(/\/properties\//g, '.').replace(/\/items/g, '[]').replace(/\/(oneOf|anyOf|allOf)\/(\d+)/g, '<$1 $2>').replace(/^\./, '').replace(/^\//, '').replace(/~1/g, '/').replace(/~0/g, '~') || '(root)'
 
@@ -335,15 +484,24 @@ function compareObject(ctx: Ctx, o: Node, u: Node) {
   const os = single(o.s), us = single(u.s)
   const permits = (s: any) => s.additionalProperties !== false
   const apSchema = (s: any) => schemaOf(s.additionalProperties)
-  const open = (s: any) => permits(s) && !apSchema(s) && !Object.keys(s.patternProperties ?? {}).length && ['absent', 'empty'].includes(uneval(s.unevaluatedProperties))
+  const patOf = (s: any) => (isPlainObject(s.patternProperties) ? s.patternProperties : {})
+  const open = (s: any) => permits(s) && !apSchema(s) && !Object.keys(patOf(s)).length && ['absent', 'empty'].includes(uneval(s.unevaluatedProperties))
   const partial = (n: Node, s: any, name: string, path: string): Node | null => {
-    for (const [p, v] of Object.entries(s.patternProperties ?? {})) if (new RegExp(p).test(name)) return { s: v, ptr: `${n.ptr}/patternProperties/${esc(p)}`, path }
+    for (const [p, v] of Object.entries(patOf(s))) {
+      try {
+        if (new RegExp(p).test(name)) return { s: v, ptr: `${n.ptr}/patternProperties/${esc(p)}`, path }
+      } catch {
+        /* invalid regex is rejected by parseJsonSchema */
+      }
+    }
     if (apSchema(s)) return { s: apSchema(s), ptr: `${n.ptr}/additionalProperties`, path }
     if (permits(s) && uneval(s.unevaluatedProperties) === 'schema') return { s: s.unevaluatedProperties, ptr: `${n.ptr}/unevaluatedProperties`, path }
     return null
   }
-  const op = os.properties ?? {}, up = us.properties ?? {}
-  const oreq: string[] = os.required ?? [], ureq: string[] = us.required ?? []
+  const op = isPlainObject(os.properties) ? os.properties : {}
+  const up = isPlainObject(us.properties) ? us.properties : {}
+  const oreq: string[] = Array.isArray(os.required) ? os.required : []
+  const ureq: string[] = Array.isArray(us.required) ? us.required : []
   const propO = (n: string): Node => ({ s: op[n], ptr: `${o.ptr}/properties/${esc(n)}`, path: join(o.path, `properties/${n}`) })
   const propU = (n: string): Node => ({ s: up[n], ptr: `${u.ptr}/properties/${esc(n)}`, path: join(u.path, `properties/${n}`) })
 
@@ -409,9 +567,9 @@ function compareDependencies(ctx: Ctx, o: Node, u: Node) {
   const read = (n: Node) => {
     const s = single(n.s)
     const lists: Record<string, { v: string[]; key: string }> = {}, schemas: Record<string, { v: unknown; key: string }> = {}
-    for (const [k, v] of Object.entries(s.dependencies ?? {})) (Array.isArray(v) ? lists : schemas)[k] = { v: v as any, key: 'dependencies' }
-    for (const [k, v] of Object.entries(s.dependentRequired ?? {})) lists[k] = { v: v as string[], key: 'dependentRequired' }
-    for (const [k, v] of Object.entries(s.dependentSchemas ?? {})) schemas[k] = { v, key: 'dependentSchemas' }
+    for (const [k, v] of Object.entries(isPlainObject(s.dependencies) ? s.dependencies : {})) (Array.isArray(v) ? lists : schemas)[k] = { v: v as any, key: 'dependencies' }
+    for (const [k, v] of Object.entries(isPlainObject(s.dependentRequired) ? s.dependentRequired : {})) if (Array.isArray(v)) lists[k] = { v: v as string[], key: 'dependentRequired' }
+    for (const [k, v] of Object.entries(isPlainObject(s.dependentSchemas) ? s.dependentSchemas : {})) schemas[k] = { v, key: 'dependentSchemas' }
     return { lists, schemas }
   }
   const a = read(o), b = read(u)
@@ -451,9 +609,9 @@ function compareArray(ctx: Ctx, o: Node, u: Node) {
   // Three shapes of the same idea: draft 4-2019 `items: [..]` + additionalItems, 2020-12 prefixItems + items,
   // and a plain `items` schema for every element.
   const shape = (s: any) => {
-    const tupleKey = s.prefixItems ? 'prefixItems' : Array.isArray(s.items) ? 'items' : null
-    const restKey = s.prefixItems ? 'items' : 'additionalItems'
-    const rest = tupleKey ? s[restKey] : s.prefixItems ? s.items : s.additionalItems
+    const tupleKey = Array.isArray(s.prefixItems) ? 'prefixItems' : Array.isArray(s.items) ? 'items' : null
+    const restKey = Array.isArray(s.prefixItems) ? 'items' : 'additionalItems'
+    const rest = tupleKey ? s[restKey] : Array.isArray(s.prefixItems) ? s.items : s.additionalItems
     return {
       tupleKey, restKey,
       tuple: (tupleKey ? s[tupleKey] : []) as unknown[],
@@ -605,16 +763,18 @@ function typeFix(ctx: Ctx, o: Node, u: Node): Fix {
 /** Restore a property on the newer side to what the older side says (or remove it if the older side lacks it). */
 function restore(ctx: Ctx, o: Node, u: Node, name: string): Fix {
   const [nNode, oNode] = ctx.newer === 'reader' ? [u, o] : [o, u]
-  const oProp = oNode.s.properties?.[name]
+  const oProp = isPlainObject(oNode.s.properties) ? oNode.s.properties[name] : undefined
+  const nProps = isPlainObject(nNode.s.properties) ? nNode.s.properties : {}
+  const nReq = Array.isArray(nNode.s.required) ? nNode.s.required : undefined
   const ptr = `${nNode.ptr}/properties/${esc(name)}`
   if (oProp === undefined)
-    return { label: `Remove property '${name}' from the new version`, ops: [{ op: 'remove', ptr }, ...(nNode.s.required?.includes(name) ? [{ op: 'set', ptr: `${nNode.ptr}/required`, value: nNode.s.required.filter((r: string) => r !== name) } as PatchOp] : [])] }
-  return { label: `Restore property '${name}'`, ops: [{ op: 'set', ptr: `${nNode.ptr}/properties`, value: { ...(nNode.s.properties ?? {}), [name]: oProp } }] }
+    return { label: `Remove property '${name}' from the new version`, ops: [{ op: 'remove', ptr }, ...(nReq?.includes(name) ? [{ op: 'set', ptr: `${nNode.ptr}/required`, value: nReq.filter((r: string) => r !== name) } as PatchOp] : [])] }
+  return { label: `Restore property '${name}'`, ops: [{ op: 'set', ptr: `${nNode.ptr}/properties`, value: { ...nProps, [name]: oProp } }] }
 }
 
 function openAddFix(ctx: Ctx, o: Node, u: Node, name: string): Fix {
   if (ctx.newer !== 'reader') return restore(ctx, o, u, name)
-  const req: string[] = u.s.required ?? []
+  const req: string[] = Array.isArray(u.s.required) ? u.s.required : []
   const ops: PatchOp[] = [{ op: 'set', ptr: `${u.ptr}/properties/${esc(name)}`, value: {} }]
   if (req.includes(name)) ops.push({ op: 'set', ptr: `${u.ptr}/required`, value: req.filter((r) => r !== name) })
   return { label: `Relax '${name}' to an empty schema {}`, ops }
@@ -634,16 +794,21 @@ function zeroFor(s: any): unknown {
 
 function requiredFix(ctx: Ctx, o: Node, u: Node, name: string): Fix {
   if (ctx.newer === 'reader') {
-    const p = deref(ctx.updDoc, { s: u.s.properties?.[name], ptr: `${u.ptr}/properties/${esc(name)}`, path: '' })
-    if (p.s && typeof p.s === 'object') {
+    const uProps = isPlainObject(u.s.properties) ? u.s.properties : undefined
+    const uReq = Array.isArray(u.s.required) ? u.s.required : []
+    const p = deref(ctx.updDoc, { s: uProps?.[name], ptr: `${u.ptr}/properties/${esc(name)}`, path: '' })
+    if (isPlainObject(p.s)) {
       const v = zeroFor(p.s)
       return { label: `Add "default": ${JSON.stringify(v)} to '${name}'`, ops: [{ op: 'set', ptr: `${p.ptr}/default`, value: v }] }
     }
-    return { label: `Make '${name}' optional again`, ops: [{ op: 'set', ptr: `${u.ptr}/required`, value: (u.s.required ?? []).filter((r: string) => r !== name) }] }
+    return { label: `Make '${name}' optional again`, ops: [{ op: 'set', ptr: `${u.ptr}/required`, value: uReq.filter((r: string) => r !== name) }] }
   }
   // The newer schema is the writer, the old reader insists on this property: the new version must keep sending it.
-  const ops: PatchOp[] = [{ op: 'set', ptr: `${o.ptr}/required`, value: [...new Set([...(o.s.required ?? []), name])] }]
-  if (o.s.properties?.[name] === undefined) ops.push({ op: 'set', ptr: `${o.ptr}/properties`, value: { ...(o.s.properties ?? {}), [name]: u.s.properties?.[name] ?? {} } })
+  const oReq = Array.isArray(o.s.required) ? o.s.required : []
+  const oProps = isPlainObject(o.s.properties) ? o.s.properties : {}
+  const uProps = isPlainObject(u.s.properties) ? u.s.properties : {}
+  const ops: PatchOp[] = [{ op: 'set', ptr: `${o.ptr}/required`, value: [...new Set([...oReq, name])] }]
+  if (oProps[name] === undefined) ops.push({ op: 'set', ptr: `${o.ptr}/properties`, value: { ...oProps, [name]: uProps[name] ?? {} } })
   return { label: `Keep '${name}' required in the new version`, ops }
 }
 

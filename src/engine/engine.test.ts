@@ -291,3 +291,122 @@ test('share links round-trip; junk hashes are refused', async () => {
   assert.equal(back.format, 'PROTOBUF')
   assert.equal(await decodeSubject('not-a-real-hash'), null)
 })
+
+test('json: wrong-typed schema keywords fail to parse and never throw out of analyze', () => {
+  const base = JSON.stringify({ type: 'object', properties: { id: { type: 'string' } }, required: ['id'] })
+  const malformed = [
+    { type: 'object', properties: 5 },
+    { type: 'object', properties: 'x' },
+    { type: 'object', properties: true },
+    { type: 'object', properties: -1 },
+    { type: 'object', properties: null },
+    { type: 'object', properties: [] },
+    { type: 'object', properties: { id: 5 } },
+    { type: 'object', properties: { id: 'x' } },
+    { type: 'object', properties: { id: -1 } },
+    { type: 'object', properties: { id: null } },
+    { type: 'object', properties: { id: [] } },
+    { type: 'object', required: 5 },
+    { type: 'object', required: true },
+    { type: 'object', required: [5] },
+    { type: 'object', additionalProperties: 5 },
+    { type: 'object', unevaluatedProperties: 'yes' },
+    { type: 'object', patternProperties: 5 },
+    { type: 'object', patternProperties: { '[': { type: 'string' } } },
+    { type: 'object', patternProperties: { '^a': 5 } },
+    { type: 'object', dependencies: 5 },
+    { type: 'object', dependencies: { a: 5 } },
+    { type: 'object', dependencies: { a: [5] } },
+    { type: 'object', dependentRequired: { a: 5 } },
+    { type: 'object', dependentSchemas: { a: 5 } },
+    { type: 'array', items: 5 },
+    { type: 'array', items: [5] },
+    { type: 'array', prefixItems: 5 },
+    { type: 'array', additionalItems: 'no' },
+    { allOf: 5 },
+    { oneOf: [null] },
+    { anyOf: ['string'] },
+    { not: 5 },
+    { enum: 5 },
+    { type: ['string', 5] },
+    { definitions: 5 },
+    { $defs: { Bad: 5 } },
+    { $ref: 5 },
+    { $ref: '#/definitions/Bad', definitions: { Bad: 5 } },
+    { $ref: '#/definitions/A', definitions: { A: { $ref: '#/definitions/B' }, B: { $ref: '#/definitions/A' } } },
+  ]
+  for (const doc of malformed) {
+    const text = JSON.stringify(doc)
+    const p = parseVersion('JSON', text)
+    assert.equal(p.ok, false, `expected parse failure for ${text}`)
+    const a = analyze({
+      format: 'JSON',
+      policy: 'STRICT',
+      versions: [{ id: 'v1', text: base }, { id: 'v2', text }],
+    })
+    assert.equal(a.parsed[1].ok, false, text)
+    assert.equal(a.pair(1, 0), null, text)
+    assert.equal(a.pair(0, 1), null, text)
+    for (const m of MODES) assert.equal(a.verdict(1, m), 'invalid', `${text} under ${m}`)
+  }
+
+  // Mutate every top-level and property-level value in User profile v2 with wrong types: never throws.
+  const v2 = JSON.parse(SAMPLES[1].subject.versions[1].text)
+  for (const k of Object.keys(v2)) {
+    for (const junk of [5, 'x', null, [], {}, true, -1]) {
+      const mut = structuredClone(v2)
+      mut[k] = junk
+      const a = analyze({
+        format: 'JSON',
+        policy: 'STRICT',
+        versions: [{ id: 'v1', text: base }, { id: 'v2', text: JSON.stringify(mut) }],
+      })
+      assert.ok(a.parsed.length === 2)
+    }
+  }
+  for (const junk of [5, 'x', null, [], {}, true, -1]) {
+    const mut = structuredClone(v2)
+    mut.properties.id = junk
+    const a = analyze({
+      format: 'JSON',
+      policy: 'STRICT',
+      versions: [{ id: 'v1', text: base }, { id: 'v2', text: JSON.stringify(mut) }],
+    })
+    assert.ok(a.parsed.length === 2)
+  }
+})
+
+test('analyze: unexpected checkPair failures fail closed per-version instead of throwing', () => {
+  const s = SAMPLES[0].subject
+  const selfFail = analyze(
+    { ...s, versions: s.versions.slice(0, 2) },
+    {
+      checkPair: (format, r) => {
+        if (format === 'AVRO' && r.root.fields.some((f: any) => f.name === 'status')) throw new Error('unexpected engine boom')
+        return []
+      },
+    },
+  )
+  assert.equal(selfFail.parsed[0].ok, true)
+  assert.equal(selfFail.parsed[1].ok, false)
+  assert.equal(!selfFail.parsed[1].ok && selfFail.parsed[1].stage, 'analysis')
+  assert.equal(!selfFail.parsed[1].ok && selfFail.parsed[1].error, 'unexpected engine boom')
+  assert.equal(selfFail.pair(1, 0), null)
+  for (const m of MODES) assert.equal(selfFail.verdict(1, m), 'invalid')
+
+  const pairFail = analyze(
+    { ...s, versions: s.versions.slice(0, 2) },
+    {
+      checkPair: (_format, r, w) => {
+        if (r !== w) throw new Error('pairwise boom')
+        return []
+      },
+    },
+  )
+  assert.equal(pairFail.parsed[0].ok, true)
+  assert.equal(pairFail.parsed[1].ok, false)
+  assert.equal(!pairFail.parsed[1].ok && pairFail.parsed[1].stage, 'analysis')
+  assert.equal(pairFail.pair(1, 0), null)
+  assert.equal(pairFail.pair(0, 1), null)
+  for (const m of MODES) assert.equal(pairFail.verdict(1, m), 'invalid')
+})
